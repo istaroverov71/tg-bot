@@ -1,0 +1,6 @@
+.env
+bookings.db
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store

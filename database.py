@@ -542,9 +542,18 @@ class Database:
         """
         Получить всех пользователей, у которых НЕТ активной записи на текущей неделе
         (для уведомления о новых слотах).
+
+        Использует диапазон дат пн-вс (как get_user_active_booking), а не week_start,
+        чтобы корректно работать со слотами из /update_week, которые могут иметь
+        week_start следующей недели.
         """
         today = datetime.now(TIMEZONE).date()
-        week_start = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
+        week_monday = today - timedelta(days=today.weekday())
+        week_sunday = week_monday + timedelta(days=6)
+        week_monday_str = week_monday.strftime("%Y-%m-%d")
+        week_sunday_str = week_sunday.strftime("%Y-%m-%d")
+        now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+
         with self.get_connection() as conn:
             rows = conn.execute('''
                 SELECT u.user_id, u.first_name, u.username
@@ -553,9 +562,11 @@ class Database:
                     SELECT b.user_id FROM bookings b
                     JOIN time_slots ts ON b.slot_id = ts.id
                     WHERE b.status = 'active'
-                      AND ts.week_start = ?
+                      AND ts.date >= ?
+                      AND ts.date <= ?
+                      AND (ts.date || ' ' || ts.adjusted_time) > ?
                 )
-            ''', (week_start,)).fetchall()
+            ''', (week_monday_str, week_sunday_str, now_str)).fetchall()
         return [{'user_id': r[0], 'first_name': r[1], 'username': r[2]} for r in rows]
 
     def cancel_booking(self, user_id: int, booking_id: Optional[int] = None) -> bool:

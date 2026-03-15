@@ -558,25 +558,16 @@ class Database:
             conn.commit()
             return cur.rowcount
 
-    def get_users_with_no_booking_this_week(self) -> List[dict]:
+    def get_users_without_booking_on_week(self, week_monday_str: str, week_sunday_str: str) -> List[dict]:
         """
-        Получить всех пользователей, у которых НЕТ активной БУДУЩЕЙ записи
-        на текущей неделе (для уведомления о новых слотах).
+        Получить пользователей без активной БУДУЩЕЙ записи на указанной неделе
+        (пн-вс задаётся строками YYYY-MM-DD).
 
-        Перед выборкой завершает прошедшие сессии, чтобы пользователь,
-        чья сессия уже состоялась, снова попал в список для уведомлений.
-
-        Использует диапазон дат пн-вс (как get_user_active_booking), а не week_start,
-        чтобы корректно работать со слотами из /update_week, которые могут иметь
-        week_start следующей недели.
+        Перед выборкой завершает прошедшие сессии.
+        Используется для рассылки: если слоты добавляются на текущую неделю —
+        уведомляем только тех, кто на неё не записан.
         """
         self.complete_past_sessions()
-
-        today = datetime.now(TIMEZONE).date()
-        week_monday = today - timedelta(days=today.weekday())
-        week_sunday = week_monday + timedelta(days=6)
-        week_monday_str = week_monday.strftime("%Y-%m-%d")
-        week_sunday_str = week_sunday.strftime("%Y-%m-%d")
         now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
 
         with self.get_connection() as conn:
@@ -593,6 +584,16 @@ class Database:
                 )
             ''', (week_monday_str, week_sunday_str, now_str)).fetchall()
         return [{'user_id': r[0], 'first_name': r[1], 'username': r[2]} for r in rows]
+
+    # Обратная совместимость
+    def get_users_with_no_booking_this_week(self) -> List[dict]:
+        today = datetime.now(TIMEZONE).date()
+        week_monday = today - timedelta(days=today.weekday())
+        week_sunday = week_monday + timedelta(days=6)
+        return self.get_users_without_booking_on_week(
+            week_monday.strftime("%Y-%m-%d"),
+            week_sunday.strftime("%Y-%m-%d"),
+        )
 
     def cancel_booking(self, user_id: int, booking_id: Optional[int] = None) -> bool:
         """Старый метод для обратной совместимости."""

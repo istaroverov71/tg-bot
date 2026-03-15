@@ -702,10 +702,27 @@ async def admin_update_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary_text = "Расписание обновлено:\n\n" + "\n\n".join(summary)
     await update.message.reply_text(summary_text)
 
-    # Рассылка пользователям без записи на текущую неделю
-    users_to_notify = db.get_users_with_no_booking_this_week()
+    # Определяем недели добавленных слотов и для каждой ищем незаписанных.
+    # Правило: уведомление получает тот, у кого нет записи на ЦЕЛЕВУЮ неделю слотов.
+    # Если в одной команде добавлены слоты на разные недели — объединяем получателей
+    # без дублей.
+    added_weeks = {}  # week_start -> sunday_str
+    for e in entries:
+        ws = e["week_start"]
+        if ws not in added_weeks:
+            ws_dt = datetime.strptime(ws, "%Y-%m-%d")
+            added_weeks[ws] = (ws_dt + timedelta(days=6)).strftime("%Y-%m-%d")
+
+    seen_ids: set = set()
+    users_to_notify = []
+    for monday_str, sunday_str in added_weeks.items():
+        for u in db.get_users_without_booking_on_week(monday_str, sunday_str):
+            if u["user_id"] not in seen_ids:
+                seen_ids.add(u["user_id"])
+                users_to_notify.append(u)
+
     users_to_notify = [u for u in users_to_notify if u["user_id"] not in ADMIN_IDS]
-    logger.info(f"Рассылка о новых слотах: {len(users_to_notify)} пользователей")
+    logger.info(f"Рассылка о новых слотах (недели: {list(added_weeks.keys())}): {len(users_to_notify)} пользователей")
 
     if users_to_notify:
         day_blocks = []

@@ -538,15 +538,40 @@ class Database:
             ''', (user_id, week_monday_str, week_sunday_str, now_str)).fetchone()[0]
         return count
 
+    def complete_past_sessions(self) -> int:
+        """
+        Перевести прошедшие активные сессии в статус 'completed'.
+        Вызывается перед выборкой активных записей, чтобы пользователи,
+        чьи сессии уже состоялись, снова попадали в список для уведомлений.
+        Возвращает количество завершённых записей.
+        """
+        now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+        with self.get_connection() as conn:
+            cur = conn.execute('''
+                UPDATE bookings SET status = 'completed'
+                WHERE status = 'active'
+                  AND slot_id IN (
+                      SELECT id FROM time_slots
+                      WHERE (date || ' ' || adjusted_time) < ?
+                  )
+            ''', (now_str,))
+            conn.commit()
+            return cur.rowcount
+
     def get_users_with_no_booking_this_week(self) -> List[dict]:
         """
-        Получить всех пользователей, у которых НЕТ активной записи на текущей неделе
-        (для уведомления о новых слотах).
+        Получить всех пользователей, у которых НЕТ активной БУДУЩЕЙ записи
+        на текущей неделе (для уведомления о новых слотах).
+
+        Перед выборкой завершает прошедшие сессии, чтобы пользователь,
+        чья сессия уже состоялась, снова попал в список для уведомлений.
 
         Использует диапазон дат пн-вс (как get_user_active_booking), а не week_start,
         чтобы корректно работать со слотами из /update_week, которые могут иметь
         week_start следующей недели.
         """
+        self.complete_past_sessions()
+
         today = datetime.now(TIMEZONE).date()
         week_monday = today - timedelta(days=today.weekday())
         week_sunday = week_monday + timedelta(days=6)

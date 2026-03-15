@@ -483,17 +483,9 @@ class Database:
 
     def get_user_active_booking(self, user_id: int) -> Optional[dict]:
         """
-        Первая активная запись пользователя на текущей КАЛЕНДАРНОЙ неделе
-        (пн-вс по дате слота), время которой ещё не прошло.
-        Привязка идёт к дате слота, а не к week_start — это позволяет
-        корректно работать со слотами на следующую неделю.
+        Первая активная запись пользователя, время которой ещё не прошло.
+        Без ограничения по неделе — находит записи на текущей И следующей неделе.
         """
-        today = datetime.now(TIMEZONE).date()
-        # Начало и конец текущей календарной недели (пн-вс)
-        week_monday = today - timedelta(days=today.weekday())
-        week_sunday = week_monday + timedelta(days=6)
-        week_monday_str = week_monday.strftime("%Y-%m-%d")
-        week_sunday_str = week_sunday.strftime("%Y-%m-%d")
         now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
 
         with self.get_connection() as conn:
@@ -504,12 +496,10 @@ class Database:
                 JOIN time_slots ts ON b.slot_id = ts.id
                 WHERE b.user_id = ?
                   AND b.status  = 'active'
-                  AND ts.date >= ?
-                  AND ts.date <= ?
                   AND (ts.date || ' ' || ts.adjusted_time) > ?
                 ORDER BY ts.date, ts.base_time
                 LIMIT 1
-            ''', (user_id, week_monday_str, week_sunday_str, now_str)).fetchone()
+            ''', (user_id, now_str)).fetchone()
 
         if row:
             return {

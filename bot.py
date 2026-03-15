@@ -412,12 +412,18 @@ async def process_final_booking(query, context, slot_id: int):
     success, message, slot_info = db.book_slot_with_scheduler(user_id, slot_id, week_start, is_admin=is_admin)
 
     if success:
+        # slot_info['time'] содержит base_time занятого слота.
+        # Но пользователь видел current_time (сдвинутое время) — берём его из контекста.
+        display_time = slot_info['time']
+        if target_slot and hasattr(target_slot, 'current_time'):
+            display_time = target_slot.current_time
+
         _dl = _day_label(slot_info['day'], slot_info['date'])
 
         await query.edit_message_text(
             f"✅ **Запись подтверждена!**\n\n"
             f"📅 {_dl}\n"
-            f"⏰ {slot_info['time']}\n\n"
+            f"⏰ {display_time}\n\n"
             f"Сессия продлится 60 минут.\n"
             f"За 15 минут до начала я пришлю напоминание.\n\n"
             f"До встречи! 🌸",
@@ -435,7 +441,7 @@ async def process_final_booking(query, context, slot_id: int):
                 f"👤 Клиент: {first} {last}\n"
                 f"📱 Username: {uname}\n"
                 f"🆔 ID: {user.id}\n\n"
-                f"📅 Слот: {_dl} в {slot_info['time']}"
+                f"📅 Слот: {_dl} в {display_time}"
             )
             for admin_id in ADMIN_IDS:
                 try:

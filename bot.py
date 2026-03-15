@@ -724,6 +724,15 @@ async def admin_update_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_to_notify = [u for u in users_to_notify if u["user_id"] not in ADMIN_IDS]
     logger.info(f"Рассылка о новых слотах (недели: {list(added_weeks.keys())}): {len(users_to_notify)} пользователей")
 
+    # --- Диагностика рассылки (видна только администратору) ---
+    diag_lines = [f"🔍 Диагностика рассылки:"]
+    diag_lines.append(f"• Недели слотов: {list(added_weeks.keys())}")
+    diag_lines.append(f"• Кандидатов на уведомление: {len(users_to_notify)}")
+    for u in users_to_notify:
+        diag_lines.append(f"  – {u['first_name']} (@{u['username']}) id={u['user_id']}")
+    await update.message.reply_text("\n".join(diag_lines))
+    # --- конец диагностики ---
+
     if users_to_notify:
         day_blocks = []
         for (_lbl, _times) in notif_lines:
@@ -734,15 +743,19 @@ async def admin_update_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + "\n\nНажмите «✍🏻 Запись» чтобы забронировать время."
         )
         sent = 0
+        failed_details = []
         for u in users_to_notify:
             try:
                 await context.bot.send_message(u["user_id"], notif_text)
                 sent += 1
+                logger.info(f"✅ Уведомление отправлено {u['user_id']} ({u['first_name']})")
             except Exception as e:
+                failed_details.append(f"{u['first_name']} (id={u['user_id']}): {e}")
                 logger.warning(f"Не удалось уведомить {u['user_id']}: {e}")
-        await update.message.reply_text(
-            f"📣 Уведомлено {sent} из {len(users_to_notify)} пользователей."
-        )
+        result_msg = f"📣 Уведомлено {sent} из {len(users_to_notify)} пользователей."
+        if failed_details:
+            result_msg += "\n\n❌ Ошибки:\n" + "\n".join(failed_details)
+        await update.message.reply_text(result_msg)
     else:
         await update.message.reply_text(
             "ℹ️ Нет пользователей для уведомления (все уже записаны или ещё не использовали бот)."

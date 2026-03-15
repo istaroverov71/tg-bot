@@ -40,7 +40,7 @@ from slot_scheduler import SmartScheduler, Slot
 
 # Аббревиатуры дней для отображения пользователю
 _DAY_ABBR = {
-    "Понедельник": "Пн", "Вторник": "Вт", "Среда": "Ср",
+    "Понедельник": "Пн ", "Вторник": "Вт ", "Среда": "Ср ",
     "Четверг": "Чт ", "Пятница": "Пт ", "Суббота": "Сб ", "Воскресенье": "Вск ",
 }
 
@@ -143,13 +143,27 @@ async def show_booking_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
         existing = db.get_user_active_booking(user_id)
         if existing:
             await reply(
-                ALREADY_BOOKED.format(slot=f"{existing['day']} {existing['time']}"),
+                ALREADY_BOOKED.format(slot=f"{_day_label(existing['day'], existing['date'])} в {existing['time']}"),
                 reply_markup=Keyboards.get_main_keyboard(),
             )
             return
 
+    # Ищем слоты на текущую И следующую неделю — берём все будущие
     week_start = slot_manager.current_week_start
     all_slots = db.get_all_slots_for_scheduling(week_start)
+
+    # Если на текущей неделе нет — ищем на следующей и далее
+    if not all_slots:
+        next_week = (
+            datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=7)
+        ).strftime("%Y-%m-%d")
+        all_slots = db.get_all_slots_for_scheduling(next_week)
+        if not all_slots:
+            # Ещё попробуем через 2 недели
+            week_after = (
+                datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=14)
+            ).strftime("%Y-%m-%d")
+            all_slots = db.get_all_slots_for_scheduling(week_after)
 
     if not all_slots:
         await reply(NO_SLOTS_MESSAGE, reply_markup=Keyboards.get_main_keyboard())
@@ -366,7 +380,7 @@ async def process_booking(query, context, slot_id: int):
         existing = db.get_user_active_booking(user_id)
         if existing:
             await query.edit_message_text(
-                ALREADY_BOOKED.format(slot=f"{existing['day']} {existing['time']}")
+                ALREADY_BOOKED.format(slot=f"{_day_label(existing['day'], existing['date'])} в {existing['time']}")
             )
             return
     await show_booking_confirmation(query, context, slot_id)
@@ -375,19 +389,27 @@ async def process_booking(query, context, slot_id: int):
 async def process_final_booking(query, context, slot_id: int):
     """Финальная запись с умным планировщиком и уведомлением админу."""
     user_id = query.from_user.id
-    week_start = slot_manager.current_week_start
     is_admin = user_id in ADMIN_IDS
 
     # Обычный пользователь — проверяем ограничение одна запись в неделю
     if not is_admin:
         existing = db.get_user_active_booking(user_id)
         if existing:
+            dl = _day_label(existing['day'], existing['date'])
             await query.edit_message_text(
-                ALREADY_BOOKED.format(slot=f"{existing['day']} {existing['time']}")
+                ALREADY_BOOKED.format(slot=f"{dl} в {existing['time']}")
             )
             return
 
-    success, message, slot_info = db.book_slot_with_scheduler(user_id, slot_id, week_start)
+    # Берём week_start из самого слота — он может быть на следующей неделе
+    all_slots = context.user_data.get('all_slots', [])
+    target_slot = next((s for s in all_slots if s.id == slot_id), None)
+    if target_slot:
+        week_start = target_slot.week_start
+    else:
+        week_start = slot_manager.current_week_start
+
+    success, message, slot_info = db.book_slot_with_scheduler(user_id, slot_id, week_start, is_admin=is_admin)
 
     if success:
         _dl = _day_label(slot_info['day'], slot_info['date'])
@@ -449,24 +471,32 @@ async def process_cancellation(query, context, booking_id: int):
                 )
                 return
 
+    # Получаем инфо о записи ДО отмены чтобы включить в уведомление
+    cancel_info = db.get_booking_by_id(booking_id)
+
     if db.cancel_booking_with_scheduler(user_id, booking_id):
         await query.edit_message_text(
             "✅ **Запись успешно отменена.**\n\n"
             "Если хотите записаться снова, нажмите кнопку «Запись» в главном меню.",
             parse_mode='Markdown',
         )
-        # Уведомление администратору
+        # Уведомление администратору с информацией о слоте
         for admin_id in ADMIN_IDS:
             try:
                 user = query.from_user
                 first = user.first_name or ''
                 last = user.last_name or ''
                 uname = f"@{user.username}" if user.username else 'нет username'
+                slot_info_str = ""
+                if cancel_info:
+                    dl = _day_label(cancel_info['day'], cancel_info['date'])
+                    slot_info_str = f"\n📅 Слот: {dl} в {cancel_info['adjusted_time']}"
                 cancel_msg = (
                     f"❌ Запись отменена\n\n"
                     f"👤 Клиент: {first} {last}\n"
                     f"📱 Username: {uname}\n"
                     f"🆔 ID: {user_id}"
+                    f"{slot_info_str}"
                 )
                 await context.bot.send_message(admin_id, cancel_msg)
                 logger.info(f"✅ Уведомление об отмене отправлено админу {admin_id}")

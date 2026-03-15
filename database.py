@@ -351,7 +351,7 @@ class Database:
             conn.commit()
 
     def book_slot_with_scheduler(
-        self, user_id: int, slot_id: int, week_start: str
+        self, user_id: int, slot_id: int, week_start: str, is_admin: bool = False
     ) -> Tuple[bool, Optional[str], Optional[Dict]]:
         """
         Забронировать слот через SmartScheduler.
@@ -366,7 +366,7 @@ class Database:
             return False, "Нет слотов на эту неделю", None
 
         scheduler = SmartScheduler(all_slots)
-        success, booked_time, changes = scheduler.book_slot(slot_id, user_id)
+        success, booked_time, changes = scheduler.book_slot(slot_id, user_id, is_admin=is_admin)
 
         if not success:
             return False, booked_time, None
@@ -483,13 +483,17 @@ class Database:
 
     def get_user_active_booking(self, user_id: int) -> Optional[dict]:
         """
-        Первая активная запись пользователя на текущей неделе,
-        время которой ещё не прошло.
-        Если сессия уже состоялась — считаем пользователя свободным.
+        Первая активная запись пользователя на текущей КАЛЕНДАРНОЙ неделе
+        (пн-вс по дате слота), время которой ещё не прошло.
+        Привязка идёт к дате слота, а не к week_start — это позволяет
+        корректно работать со слотами на следующую неделю.
         """
         today = datetime.now(TIMEZONE).date()
-        week_start = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
-        # Текущее время в UTC для сравнения с датой+временем слота
+        # Начало и конец текущей календарной недели (пн-вс)
+        week_monday = today - timedelta(days=today.weekday())
+        week_sunday = week_monday + timedelta(days=6)
+        week_monday_str = week_monday.strftime("%Y-%m-%d")
+        week_sunday_str = week_sunday.strftime("%Y-%m-%d")
         now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
 
         with self.get_connection() as conn:
@@ -500,11 +504,12 @@ class Database:
                 JOIN time_slots ts ON b.slot_id = ts.id
                 WHERE b.user_id = ?
                   AND b.status  = 'active'
-                  AND ts.week_start = ?
+                  AND ts.date >= ?
+                  AND ts.date <= ?
                   AND (ts.date || ' ' || ts.adjusted_time) > ?
                 ORDER BY ts.date, ts.base_time
                 LIMIT 1
-            ''', (user_id, week_start, now_str)).fetchone()
+            ''', (user_id, week_monday_str, week_sunday_str, now_str)).fetchone()
 
         if row:
             return {
@@ -514,9 +519,12 @@ class Database:
         return None
 
     def get_user_active_bookings_count(self, user_id: int) -> int:
-        """Количество активных предстоящих записей пользователя на текущей неделе."""
+        """Количество активных предстоящих записей на текущей календарной неделе."""
         today = datetime.now(TIMEZONE).date()
-        week_start = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
+        week_monday = today - timedelta(days=today.weekday())
+        week_sunday = week_monday + timedelta(days=6)
+        week_monday_str = week_monday.strftime("%Y-%m-%d")
+        week_sunday_str = week_sunday.strftime("%Y-%m-%d")
         now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
         with self.get_connection() as conn:
             count = conn.execute('''
@@ -524,9 +532,10 @@ class Database:
                 JOIN time_slots ts ON b.slot_id = ts.id
                 WHERE b.user_id = ?
                   AND b.status  = 'active'
-                  AND ts.week_start = ?
+                  AND ts.date >= ?
+                  AND ts.date <= ?
                   AND (ts.date || ' ' || ts.adjusted_time) > ?
-            ''', (user_id, week_start, now_str)).fetchone()[0]
+            ''', (user_id, week_monday_str, week_sunday_str, now_str)).fetchone()[0]
         return count
 
     def get_users_with_no_booking_this_week(self) -> List[dict]:

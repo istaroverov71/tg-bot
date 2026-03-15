@@ -313,7 +313,7 @@ class SmartScheduler:
         return sorted(visible, key=lambda s: (s.date, s.current_time))
 
     def book_slot(
-        self, slot_id: int, user_id: int
+        self, slot_id: int, user_id: int, is_admin: bool = False
     ) -> Tuple[bool, Optional[str], Optional[Dict]]:
         """
         Забронировать слот и пересчитать расписание.
@@ -327,6 +327,43 @@ class SmartScheduler:
             return False, "Слот не найден", None
         if target.is_booked:
             return False, "Слот уже занят", None
+
+        # Проверка: нельзя создавать цепочку из 3 занятых слотов подряд по времени.
+        # Для администратора проверка не применяется.
+        # "Подряд" = разрыв между началами двух соседних сессий <= MIN_GAP (70 мин).
+        # Если хотя бы один разрыв в тройке > MIN_GAP — цепочка разорвана, разрешено.
+        # Примеры:
+        #   12:00, 13:10, 14:20 → разрывы 70 и 70 → оба <= 70 → ЗАПРЕЩЕНО
+        #   12:00, 13:10, 15:00 → разрывы 70 и 110 → второй > 70 → РАЗРЕШЕНО
+
+        if not is_admin:
+            same_day_booked = sorted(
+                [s for s in self.slots if s.is_booked and s.date == target.date],
+                key=lambda s: s.base_time
+            )
+
+            # Строим гипотетический список: занятые + новый слот
+            hypothetical = sorted(
+                same_day_booked + [target],
+                key=lambda s: s.base_time
+            )
+            hyp_times = [datetime.strptime(s.base_time, "%H:%M") for s in hypothetical]
+
+            # Ищем тройку где ОБА разрыва <= MIN_GAP
+            for i in range(len(hyp_times) - 2):
+                gap1 = (hyp_times[i+1] - hyp_times[i]).total_seconds() / 60
+                gap2 = (hyp_times[i+2] - hyp_times[i+1]).total_seconds() / 60
+                if gap1 <= MIN_GAP and gap2 <= MIN_GAP:
+                    slots_in_chain = {
+                        hypothetical[i].base_time,
+                        hypothetical[i+1].base_time,
+                        hypothetical[i+2].base_time
+                    }
+                    if target.base_time in slots_in_chain:
+                        return False, (
+                            "❌ Нельзя записаться: три сессии подряд слишком близко друг к другу.\n\n"
+                            "Между этой записью и соседними сессиями недостаточно перерыва."
+                        ), None
 
         # Помечаем как занятый
         target.is_booked = True

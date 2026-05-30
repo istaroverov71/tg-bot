@@ -12,7 +12,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict
 
-from models import TimeSlot, Booking, SlotAdjuster
+from models import TimeSlot, Booking
 from slot_scheduler import Slot, SmartScheduler
 from config import DATABASE_FILE, TIMEZONE, DEFAULT_SLOTS, SESSION_DURATION
 

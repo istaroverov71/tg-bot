@@ -104,21 +104,37 @@ def test_c_backward_shift():
 
 
 def test_d_chain():
-    """Сценарий Г: цепочка слотов — сдвиги вперёд"""
+    """Сценарий Г: каскадные сдвиги вперёд.
+
+    Слоты: id=1→10:00, id=2→11:00 (занят), id=3→12:00, id=4→13:00, id=5→14:00
+    После бронирования 11:00 (id=2):
+      id=1 (10:00): только занятый справа (11:00) → max_start = 11:00 - 70 = 9:50
+                    min(10:00, 9:50) = 9:50
+      id=3 (12:00): только занятый слева (11:00)  → min_start = 11:00 + 70 = 12:10
+                    max(12:00, 12:10) = 12:10
+      id=4 (13:00): каскад от id=3 (12:10)        → min_start = 12:10 + 70 = 13:20
+      id=5 (14:00): каскад от id=4 (13:20)        → min_start = 13:20 + 70 = 14:30
+    """
     slots = [make_slot(i, f"{9+i}:00") for i in range(1, 6)]
-    # Занимаем 10:00 (i=2)
+    # Бронируем id=2 (base_time = "11:00")
     s = SmartScheduler(slots)
     s.book_slot(2, 100)
 
     visible = s.get_visible_slots()
     times = {v.id: v.current_time for v in visible}
-    print(f"  Слот 1 (09:00): {times.get(1)}")
-    print(f"  Слот 3 (11:00): {times.get(3)}")
-    print(f"  Слот 4 (12:00): {times.get(4)}")
-    print(f"  Слот 5 (13:00): {times.get(5)}")
-    # slot3 должен сдвинуться: 10:00 + 70 = 11:10
-    assert times.get(3) == "11:10", f"slot3: {times.get(3)}"
-    print("✅ Сценарий Г: цепочка — OK")
+    print(f"  Слот id=1 (10:00): {times.get(1)}")
+    print(f"  Слот id=3 (12:00): {times.get(3)}")
+    print(f"  Слот id=4 (13:00): {times.get(4)}")
+    print(f"  Слот id=5 (14:00): {times.get(5)}")
+
+    assert times.get(1) == "09:50", f"slot1: {times.get(1)}"
+    # После бронирования 11:00 слот 12:00 сдвигается: 11:00 + 70 = 12:10
+    assert times.get(3) == "12:10", f"slot3: {times.get(3)}"
+    # Каскад: 12:10 + 70 = 13:20
+    assert times.get(4) == "13:20", f"slot4: {times.get(4)}"
+    # Каскад: 13:20 + 70 = 14:30
+    assert times.get(5) == "14:30", f"slot5: {times.get(5)}"
+    print("✅ Сценарий Г: каскадные сдвиги — OK")
 
 
 def test_cancel_restores():

@@ -1,23 +1,28 @@
 # slot_manager.py
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Tuple
-from models import TimeSlot, SlotAdjuster
+from typing import List, Optional, Dict
+from models import TimeSlot
 from database import Database
 from config import TIMEZONE, DEFAULT_SLOTS
 
 class SlotManager:
     """Менеджер для работы со слотами и умным расписанием"""
-    
+
     def __init__(self, db: Database):
         self.db = db
-        self.current_week_start = self._get_week_start()
-        
+
     def _get_week_start(self) -> str:
         """Получить дату начала текущей недели (понедельник)"""
         today = datetime.now(TIMEZONE).date()
         # Вычисляем понедельник текущей недели
         week_start = today - timedelta(days=today.weekday())
         return week_start.strftime("%Y-%m-%d")
+
+    @property
+    def current_week_start(self) -> str:
+        """Всегда возвращает актуальный понедельник — пересчитывается при каждом обращении.
+        Баг 2: ранее вычислялось один раз при старте, теперь обновляется автоматически."""
+        return self._get_week_start()
     
     def _get_week_days(self) -> List[str]:
         """Получить список дней текущей недели"""
@@ -70,14 +75,11 @@ class SlotManager:
     def initialize_new_week(self) -> tuple:
         """
         Публичный метод для вызова из бота (обертка для initialize_week_slots)
-        
+
         Returns:
             tuple: (success, message) - (bool, str)
         """
         try:
-            # Обновляем начало недели на случай, если неделя сменилась
-            self.current_week_start = self._get_week_start()
-            
             success = self.initialize_week_slots()
             
             if success:
@@ -117,8 +119,8 @@ class SlotManager:
                 slot_time = datetime.strptime(f"{slot.date} {slot.adjusted_time}", "%Y-%m-%d %H:%M")
                 slot_time = slot_time.replace(tzinfo=TIMEZONE)
                 
-                # Даем минимум 2 часа на подготовку
-                if slot_time <= now + timedelta(hours=2):
+                # Даем минимум 3 часа на подготовку (баг 11: было 2 часа — несоответствие с bot.py)
+                if slot_time <= now + timedelta(hours=3):
                     continue
             
             available_slots.append(slot)
@@ -130,44 +132,6 @@ class SlotManager:
         Проверить, есть ли у пользователя запись на этой неделе
         """
         return self.db.get_user_active_booking(user_id)
-    
-    def calculate_slot_adjustments(self, target_slot: TimeSlot) -> Dict[str, Optional[str]]:
-        """
-        Рассчитать все необходимые смещения слотов
-        Возвращает словарь со смещениями для каждого слота
-        """
-        all_slots = self.db.get_week_slots(self.current_week_start)
-        adjuster = SlotAdjuster(all_slots)
-        
-        adjustments = {}
-        
-        # Находим соседние слоты
-        adjacent = adjuster.find_adjacent_slots(target_slot)
-        
-        # Проверяем сценарий А (сдвиг вперед)
-        if (adjacent['next'] and 
-            adjacent['next'].is_available and 
-            not target_slot.is_available):
-            
-            # Сдвигаем следующий слот на 10 минут вперед
-            next_time = adjacent['next'].get_datetime()
-            new_time = next_time + timedelta(minutes=10)
-            adjustments[adjacent['next'].id] = new_time.strftime("%H:%M")
-        
-        # Проверяем сценарий Б (сдвиг назад)
-        if (adjacent['prev'] and 
-            not adjacent['prev'].is_available and
-            adjacent['next'] and 
-            not adjacent['next'].is_available and
-            adjacent['prev_prev'] and 
-            adjacent['prev_prev'].is_available):
-            
-            # Сдвигаем текущий слот на 10 минут назад
-            current_time = target_slot.get_datetime()
-            new_time = current_time - timedelta(minutes=10)
-            adjustments[target_slot.id] = new_time.strftime("%H:%M")
-        
-        return adjustments
     
     def get_slots_by_day(self, day: str) -> List[TimeSlot]:
         """

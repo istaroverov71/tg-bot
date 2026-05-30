@@ -285,6 +285,42 @@ class SmartScheduler:
                     clamped = max(min_start, min(base, max_start))
                     result_dt[i] = clamped
 
+        # Каскадный проход вперёд: если свободный слот X был сдвинут из-за занятого слота,
+        # следующий свободный слот X+1 тоже должен отступить на MIN_GAP от нового времени X.
+        #
+        # Важно: каскад запускается ТОЛЬКО если предшественник:
+        #   a) занят (всегда создаёт ограничение), или
+        #   b) свободен, но БЫЛ сдвинут (result ≠ base).
+        # Свободный слот, стоящий на базовом времени, каскад не запускает —
+        # иначе после отмены брони слоты не возвращались бы на исходные позиции.
+        for i in range(1, n):
+            if result_dt[i] is None or day_slots[i].is_booked:
+                continue
+            for j in range(i - 1, -1, -1):
+                if result_dt[j] is not None:
+                    prev_is_booked = day_slots[j].is_booked
+                    prev_was_shifted = (result_dt[j] != base_dt[j])
+                    if not prev_is_booked and not prev_was_shifted:
+                        # Предшественник свободен и на базовом месте — каскад не нужен
+                        break
+                    min_start_cascade = result_dt[j] + timedelta(minutes=MIN_GAP)
+                    if result_dt[i] < min_start_cascade:
+                        # Проверяем правую границу (ближайший занятый справа)
+                        right_booked_idx: Optional[int] = None
+                        for k in range(i + 1, n):
+                            if day_slots[k].is_booked:
+                                right_booked_idx = k
+                                break
+                        if right_booked_idx is not None:
+                            max_start = result_dt[right_booked_idx] - timedelta(minutes=MIN_GAP)
+                            if min_start_cascade > max_start:
+                                result_dt[i] = None  # нет места после каскадного сдвига
+                            else:
+                                result_dt[i] = min_start_cascade
+                        else:
+                            result_dt[i] = min_start_cascade
+                    break  # нашли ближайшего предшественника — выходим
+
         # Формируем результат: только доступные (не None, не занятые)
         day_result: Dict[int, str] = {}
         for i, slot in enumerate(day_slots):
@@ -365,11 +401,14 @@ class SmartScheduler:
                             "Между этой записью и соседними сессиями недостаточно перерыва."
                         ), None
 
+        # Запоминаем время, которое видел пользователь при выборе (баг 9: ранее возвращался base_time)
+        confirmed_time = target.current_time
+
         # Помечаем как занятый
         target.is_booked = True
         target.booked_by = user_id
 
-        # Пересчитываем
+        # Пересчитываем соседние слоты
         new_times = self.calculate_slot_positions()
         changes: Dict[int, Dict[str, str]] = {}
 
@@ -381,8 +420,7 @@ class SmartScheduler:
                     changes[slot.id] = {"old": old, "new": new}
                 slot.current_time = new
 
-        booked_time = new_times.get(slot_id, target.base_time)
-        return True, booked_time, changes
+        return True, confirmed_time, changes
 
     def cancel_booking(
         self, slot_id: int

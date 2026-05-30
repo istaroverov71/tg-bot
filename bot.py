@@ -210,8 +210,9 @@ async def show_my_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += "\nВы можете изменить или отменить запись."
         keyboard = [
             [InlineKeyboardButton("✏️ Изменить время", callback_data="change_booking")],
+            # Баг 4: используем pre_cancel_ чтобы сначала показать диалог «Вы уверены?»
             [InlineKeyboardButton("❌ Отменить запись",
-                                  callback_data=f"cancel_{booking['booking_id']}")],
+                                  callback_data=f"pre_cancel_{booking['booking_id']}")],
         ]
         await update.message.reply_text(
             message,
@@ -301,8 +302,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             booking_id = int(data[15:])
             await process_cancellation(query, context, booking_id)
 
+        # Баг 4: новый обработчик — показывает «Вы уверены?» перед отменой из «Мои записи»
+        elif data.startswith("pre_cancel_"):
+            booking_id = int(data[11:])
+            await pre_cancel_confirm(query, booking_id)
+
         elif data.startswith("cancel_"):
-            # Кнопка "Отменить запись" из show_my_bookings
             booking_id = int(data[7:])
             await process_cancellation(query, context, booking_id)
 
@@ -315,6 +320,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data == "change_booking":
             await process_change_booking(query, context)
+
+        # Баг 1: новый обработчик — выполняет смену после подтверждения
+        elif data.startswith("confirm_change_"):
+            booking_id = int(data[15:])
+            await execute_change_booking(query, context, booking_id)
 
     except Exception as e:
         logger.error(f"Error in callback_handler (data={data!r}): {e}", exc_info=True)
@@ -355,9 +365,27 @@ async def show_booking_confirmation(query, context, slot_id: int):
     all_slots = context.user_data.get('all_slots', [])
     target_slot = next((s for s in all_slots if s.id == slot_id), None)
 
+    # Баг 7: фолбэк — загружаем слот из БД если контекст был потерян (рестарт бота)
     if not target_slot:
-        await query.edit_message_text("❌ Слот не найден")
-        return
+        slot_db = db.get_slot_by_id(slot_id)
+        if not slot_db:
+            await query.edit_message_text(
+                "❌ Слот не найден или уже занят. Пожалуйста, начните выбор заново."
+            )
+            return
+        # Перезагружаем всю неделю и пересчитываем через SmartScheduler
+        fresh_slots = db.get_all_slots_for_scheduling(slot_db.week_start)
+        smart_fresh = SmartScheduler(fresh_slots)
+        visible_fresh = smart_fresh.get_visible_slots()
+        target_slot = next((s for s in visible_fresh if s.id == slot_id), None)
+        if not target_slot:
+            await query.edit_message_text(
+                "❌ Этот слот уже занят или недоступен. Пожалуйста, выберите другое время."
+            )
+            return
+        # Восстанавливаем контекст для последующих шагов
+        context.user_data['all_slots'] = fresh_slots
+        context.user_data['visible_slots'] = visible_fresh
 
     await query.edit_message_text(
         f"📝 **Подтверждение записи**\n\n"
@@ -412,12 +440,8 @@ async def process_final_booking(query, context, slot_id: int):
     success, message, slot_info = db.book_slot_with_scheduler(user_id, slot_id, week_start, is_admin=is_admin)
 
     if success:
-        # slot_info['time'] содержит base_time занятого слота.
-        # Но пользователь видел current_time (сдвинутое время) — берём его из контекста.
+        # slot_info['time'] теперь содержит то время, которое видел пользователь (баг 9 исправлен)
         display_time = slot_info['time']
-        if target_slot and hasattr(target_slot, 'current_time'):
-            display_time = target_slot.current_time
-
         _dl = _day_label(slot_info['day'], slot_info['date'])
 
         await query.edit_message_text(
@@ -512,11 +536,86 @@ async def process_cancellation(query, context, booking_id: int):
         await query.edit_message_text("❌ Не удалось отменить запись.")
 
 
+async def pre_cancel_confirm(query, booking_id: int):
+    """
+    Баг 4: показывает диалог «Вы уверены?» перед отменой записи из раздела «Мои записи».
+    Также проверяет 3-часовое правило, чтобы пользователь сразу получил понятный ответ.
+    """
+    user_id = query.from_user.id
+    booking_info = db.get_booking_by_id(booking_id)
+    if not booking_info:
+        await query.edit_message_text("❌ Запись не найдена.")
+        return
+
+    if user_id not in ADMIN_IDS:
+        session_dt = datetime.strptime(
+            f"{booking_info['date']} {booking_info['adjusted_time']}", "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=TIMEZONE)
+        if session_dt - datetime.now(TIMEZONE) < timedelta(hours=3):
+            await query.edit_message_text(
+                f"❌ Отмена невозможна.\n\n"
+                f"До сессии {booking_info['day']} в {booking_info['adjusted_time']} "
+                f"осталось менее 3 часов.\n\n"
+                f"Для отмены свяжитесь напрямую: @n_kshmlv"
+            )
+            return
+
+    dl = _day_label(booking_info['day'], booking_info['date'])
+    await query.edit_message_text(
+        f"Вы уверены, что хотите отменить запись?\n\n"
+        f"📅 {dl} в {booking_info['adjusted_time']}",
+        reply_markup=Keyboards.get_cancel_confirmation_keyboard(booking_id),
+    )
+
+
 async def process_change_booking(query, context):
+    """
+    Баг 1: добавлена проверка 3-часового правила и диалог подтверждения
+    перед тем, как отменить текущую запись и открыть выбор нового времени.
+    """
     user_id = query.from_user.id
     booking = db.get_user_active_booking(user_id)
 
-    if booking and db.cancel_booking_with_scheduler(user_id, booking['booking_id']):
+    if not booking:
+        await query.edit_message_text("❌ Активная запись не найдена.")
+        return
+
+    # Проверяем 3-часовое правило (кроме администратора)
+    if user_id not in ADMIN_IDS:
+        session_dt = datetime.strptime(
+            f"{booking['date']} {booking['time']}", "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=TIMEZONE)
+        if session_dt - datetime.now(TIMEZONE) < timedelta(hours=3):
+            await query.edit_message_text(
+                f"❌ Изменить запись невозможно.\n\n"
+                f"До сессии {booking['day']} в {booking['time']} "
+                f"осталось менее 3 часов.\n\n"
+                f"Для изменения свяжитесь напрямую: @n_kshmlv"
+            )
+            return
+
+    dl = _day_label(booking['day'], booking['date'])
+    keyboard = [
+        [InlineKeyboardButton(
+            "✔️ Да, изменить",
+            callback_data=f"confirm_change_{booking['booking_id']}"
+        )],
+        [InlineKeyboardButton("❌ Отмена", callback_data="back_to_main")],
+    ]
+    await query.edit_message_text(
+        f"📝 Текущая запись:\n📅 {dl} в {booking['time']}\n\n"
+        f"Она будет отменена, и вы сможете выбрать новое время.\n\nПродолжить?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def execute_change_booking(query, context, booking_id: int):
+    """Выполняет отмену и открывает выбор нового времени после подтверждения пользователя."""
+    user_id = query.from_user.id
+    booking = db.get_user_active_booking(user_id)
+
+    if booking and booking['booking_id'] == booking_id \
+            and db.cancel_booking_with_scheduler(user_id, booking_id):
         await query.edit_message_text(
             "✅ Текущая запись отменена.\n\nТеперь выберите новое время:"
         )

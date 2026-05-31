@@ -187,6 +187,57 @@ def test_gap_uses_current_time():
     print(f"✅ Баг 1 (current_time): slot3={slot3.current_time}")
 
 
+def test_fourth_slot_hidden():
+    """Тест 2: 4-й слот подряд должен быть СКРЫТ из видимых (не просто заблокирован).
+
+    Ситуация: 3 занятых подряд с реальным разрывом 70 мин (10:00→11:10→12:20).
+    Слот 13:00 стал бы 4-м → должен исчезнуть из списка.
+    Слот 15:00 далеко от цепочки → должен остаться видимым.
+    """
+    slots = [
+        make_booked(1, "10:00"),          # занят, current=10:00
+        make_booked(2, "11:00"),          # занят, current=11:10 (был сдвинут)
+        make_booked(3, "12:00"),          # занят, current=12:20 (был сдвинут)
+        make_slot(4, "13:00"),            # свободный — был бы 4-м
+        make_slot(5, "15:00"),            # свободный — далеко от цепочки
+    ]
+    # Имитируем current_time занятых слотов (как хранится в БД после серии записей)
+    slots[1].current_time = "11:10"
+    slots[2].current_time = "12:20"
+
+    s = SmartScheduler(slots)
+    visible = s.get_visible_slots()
+    visible_ids = {sl.id for sl in visible}
+
+    assert 4 not in visible_ids, (
+        f"Слот 4 (4-й подряд) не должен быть виден. Видимые: {visible_ids}"
+    )
+    assert 5 in visible_ids, (
+        f"Слот 5 (далеко) должен быть виден. Видимые: {visible_ids}"
+    )
+    print(f"✅ Тест 2 (4-й скрыт): видимые={sorted(visible_ids)}")
+
+
+def test_third_slot_visible():
+    """3-й слот подряд должен быть ВИДЕН (только 4-й блокируется)."""
+    slots = [
+        make_booked(1, "10:00"),
+        make_booked(2, "11:00"),
+        make_slot(3, "12:00"),   # 3-й — должен быть виден
+        make_slot(4, "13:00"),
+    ]
+    slots[1].current_time = "11:10"
+
+    s = SmartScheduler(slots)
+    visible = s.get_visible_slots()
+    visible_ids = {sl.id for sl in visible}
+
+    assert 3 in visible_ids, (
+        f"Слот 3 (3-й подряд) должен быть виден. Видимые: {visible_ids}"
+    )
+    print(f"✅ Тест 2 (3-й виден): видимые={sorted(visible_ids)}")
+
+
 if __name__ == "__main__":
     test_a_forward_shift()
     test_a_via_book_slot()
@@ -195,4 +246,6 @@ if __name__ == "__main__":
     test_d_chain()
     test_cancel_restores()
     test_gap_uses_current_time()
+    test_fourth_slot_hidden()
+    test_third_slot_visible()
     print("\n🎉 Все тесты пройдены!")

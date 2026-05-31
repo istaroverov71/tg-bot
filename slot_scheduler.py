@@ -288,6 +288,41 @@ class SmartScheduler:
                     clamped = max(min_start, min(base, max_start))
                     result_dt[i] = clamped
 
+        # Скрываем слоты, которые стали бы 4-м (или более) подряд в цепочке.
+        # Для каждого свободного слота считаем занятые соседние слоты подряд:
+        # непрерывно влево и вправо (разрыв ≤ MIN_GAP). Если сумма ≥ 3 — слот
+        # скрываем: бронировать его всё равно нельзя, лучше не вводить в заблуждение.
+        for i, slot in enumerate(day_slots):
+            if slot.is_booked or result_dt[i] is None:
+                continue
+
+            left_booked = 0
+            prev_t = result_dt[i]
+            for j in range(i - 1, -1, -1):
+                if result_dt[j] is None:
+                    break
+                gap = (prev_t - result_dt[j]).total_seconds() / 60
+                if day_slots[j].is_booked and gap <= MIN_GAP:
+                    left_booked += 1
+                    prev_t = result_dt[j]
+                else:
+                    break
+
+            right_booked = 0
+            prev_t = result_dt[i]
+            for j in range(i + 1, n):
+                if result_dt[j] is None:
+                    break
+                gap = (result_dt[j] - prev_t).total_seconds() / 60
+                if day_slots[j].is_booked and gap <= MIN_GAP:
+                    right_booked += 1
+                    prev_t = result_dt[j]
+                else:
+                    break
+
+            if left_booked + right_booked >= 3:
+                result_dt[i] = None  # 4-я в цепочке — скрываем
+
         # Формируем результат: только доступные (не None, не занятые)
         day_result: Dict[int, str] = {}
         for i, slot in enumerate(day_slots):

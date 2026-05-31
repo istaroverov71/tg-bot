@@ -371,10 +371,30 @@ class Database:
         if not success:
             return False, booked_time, None
 
+        booked_slot = scheduler.find_slot_by_id(slot_id)
+
         try:
             with self.get_connection() as conn:
-                # Обновляем времена и доступность всех слотов
+                # Баг 1: атомарно захватываем целевой слот.
+                # WHERE ... AND is_available=1 защищает от гонки двух пользователей:
+                # если между нашим чтением и записью другой юзер уже занял слот,
+                # rowcount = 0 — мы выходим без создания дублирующей записи.
+                cursor = conn.execute('''
+                    UPDATE time_slots
+                    SET adjusted_time = ?,
+                        is_available  = 0,
+                        booked_by     = ?
+                    WHERE id = ? AND is_available = 1
+                ''', (booked_slot.current_time, user_id, slot_id))
+
+                if cursor.rowcount == 0:
+                    # Слот занят другим пользователем прямо между нашим чтением и записью
+                    return False, "К сожалению, этот слот только что заняли. Выберите другое время.", None
+
+                # Обновляем adjusted_time остальных слотов (сдвиги от SmartScheduler)
                 for slot in scheduler.slots:
+                    if slot.id == slot_id:
+                        continue  # целевой слот уже обновлён выше
                     conn.execute('''
                         UPDATE time_slots
                         SET adjusted_time = ?,
@@ -389,7 +409,6 @@ class Database:
                     ))
 
                 # Создаём запись о бронировании
-                booked_slot = scheduler.find_slot_by_id(slot_id)
                 cursor = conn.execute('''
                     INSERT INTO bookings
                     (user_id, slot_id, original_time, adjusted_time, booking_date, status)
@@ -726,6 +745,16 @@ class Database:
         with self.get_connection() as conn:
             cur = conn.execute(
                 'UPDATE bookings SET notified_15min = 1 WHERE id = ?',
+                (booking_id,)
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def reset_notification_for_booking(self, booking_id: int) -> bool:
+        """Сбросить флаг уведомления для одной записи — повторная попытка при сбое отправки."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                'UPDATE bookings SET notified_15min = 0 WHERE id = ?',
                 (booking_id,)
             )
             conn.commit()

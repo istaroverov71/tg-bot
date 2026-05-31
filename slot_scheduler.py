@@ -381,12 +381,20 @@ class SmartScheduler:
                 key=lambda s: s.base_time
             )
 
+            # Обновляем current_time целевого слота до актуального расчётного значения.
+            # Баг 5: ранее использовался base_time, что давало неверные разрывы.
+            # Для занятых слотов current_time = подтверждённое adjusted_time из БД.
+            # Для свободного target пересчитываем свежую позицию через SmartScheduler.
+            fresh_positions = self.calculate_slot_positions()
+            if target.id in fresh_positions:
+                target.current_time = fresh_positions[target.id]
+
             # Строим гипотетический список: занятые + новый слот
             hypothetical = sorted(
                 same_day_booked + [target],
                 key=lambda s: s.base_time
             )
-            hyp_times = [datetime.strptime(s.base_time, "%H:%M") for s in hypothetical]
+            hyp_times = [datetime.strptime(s.current_time, "%H:%M") for s in hypothetical]
 
             # Ищем четвёрку где ВСЕ 3 разрыва <= MIN_GAP
             for i in range(len(hyp_times) - 3):

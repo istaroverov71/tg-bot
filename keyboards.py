@@ -94,17 +94,6 @@ class Keyboards:
         return InlineKeyboardMarkup(keyboard)
     
     @staticmethod
-    def get_booking_confirmation_keyboard(slot_id: int):
-        """Клавиатура предварительного подтверждения записи"""
-        keyboard = [
-            [
-                InlineKeyboardButton("✔️ Продолжить", callback_data=f"confirm_{slot_id}"),
-                InlineKeyboardButton("❌ Отмена", callback_data="back_to_slots")
-            ]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-    
-    @staticmethod
     def get_final_confirmation_keyboard(slot_id: int):
         """
         Клавиатура для финального подтверждения записи
@@ -126,19 +115,6 @@ class Keyboards:
                 InlineKeyboardButton("✔️ Да, отменить", callback_data=f"cancel_confirm_{booking_id}"),
                 InlineKeyboardButton("❌ Нет, оставить", callback_data="back_to_main")
             ]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-    
-    @staticmethod
-    def get_booking_actions_keyboard(booking_id: int):
-        """
-        Клавиатура действий с существующей записью
-        (НОВЫЙ МЕТОД)
-        """
-        keyboard = [
-            [InlineKeyboardButton("📝 Изменить время", callback_data="change_booking")],
-            [InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_{booking_id}")],
-            [InlineKeyboardButton("🔙 Назад в меню", callback_data="back_to_main")]
         ]
         return InlineKeyboardMarkup(keyboard)
     

@@ -294,10 +294,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             slot_id = int(data[5:])
             await show_booking_confirmation(query, context, slot_id)
 
-        elif data.startswith("confirm_"):
-            slot_id = int(data[8:])
-            await process_booking(query, context, slot_id)
-
         elif data.startswith("final_confirm_"):
             slot_id = int(data[14:])
             await process_final_booking(query, context, slot_id)
@@ -310,10 +306,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("pre_cancel_"):
             booking_id = int(data[11:])
             await pre_cancel_confirm(query, booking_id)
-
-        elif data.startswith("cancel_"):
-            booking_id = int(data[7:])
-            await process_cancellation(query, context, booking_id)
 
         elif data.startswith("force_delete_day_"):
             date_str = data[17:]
@@ -404,20 +396,6 @@ async def show_booking_confirmation(query, context, slot_id: int):
     context.user_data['selected_slot'] = target_slot
 
 
-async def process_booking(query, context, slot_id: int):
-    """Промежуточный шаг — проверить запись и показать подтверждение."""
-    user_id = query.from_user.id
-    is_admin = user_id in ADMIN_IDS
-    if not is_admin:
-        existing = db.get_user_active_booking(user_id)
-        if existing:
-            await query.edit_message_text(
-                ALREADY_BOOKED.format(slot=f"{_day_label(existing['day'], existing['date'])} в {existing['time']}")
-            )
-            return
-    await show_booking_confirmation(query, context, slot_id)
-
-
 async def process_final_booking(query, context, slot_id: int):
     """Финальная запись с умным планировщиком и уведомлением админу."""
     user_id = query.from_user.id
@@ -483,9 +461,9 @@ async def process_final_booking(query, context, slot_id: int):
         context.user_data.pop('visible_slots', None)
         context.user_data.pop('all_slots', None)
     else:
-        await query.edit_message_text(
-            f"К сожалению, этот слот только что заняли. Выберите другое время — нажмите «✍🏻 Запись» в главном меню."
-        )
+        # Баг 2: используем реальное сообщение из планировщика/БД,
+        # чтобы пользователь видел правильную причину (гонка, лимит подряд и т.д.)
+        await query.edit_message_text(message)
 
 
 async def process_cancellation(query, context, booking_id: int):
@@ -653,17 +631,25 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     upcoming = db.get_upcoming_sessions(minutes_before=15)
 
     for session in upcoming:
-        # ИСПРАВЛЕНО: REMINDER_USER использует {slot}, передаём правильный ключ
         slot_str = f"{session['day']} в {session['time']}"
 
+        # Баг 3: сначала отправляем, потом проверяем результат.
+        # get_upcoming_sessions предварительно помечает notified_15min=1 (защита от дублей).
+        # Если отправка не удалась — сбрасываем флаг, чтобы повторить при следующей проверке.
+        user_sent = False
         try:
             await context.bot.send_message(
                 session['user_id'],
                 REMINDER_USER.format(slot=slot_str),
             )
+            user_sent = True
             logger.info(f"Reminder sent to user {session['user_id']}")
         except Exception as e:
             logger.error(f"Failed to send reminder to user {session['user_id']}: {e}")
+            db.reset_notification_for_booking(session['booking_id'])
+
+        if not user_sent:
+            continue  # не беспокоим админа, если пользователь не получил уведомление
 
         for admin_id in ADMIN_IDS:
             try:
@@ -749,6 +735,10 @@ async def admin_update_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             year = datetime.now(TIMEZONE).year
             target_date_dt = datetime.strptime(f"{date_raw}.{year}", "%d.%m.%Y")
+            # Баг 4: если дата уже прошла — берём следующий год.
+            # Актуально при вводе январских слотов в декабре.
+            if target_date_dt.date() < datetime.now(TIMEZONE).date():
+                target_date_dt = datetime.strptime(f"{date_raw}.{year + 1}", "%d.%m.%Y")
             target_date = target_date_dt.strftime("%Y-%m-%d")
         except ValueError:
             errors.append(f"Неверная дата '{date_raw}'. Формат: ДД.ММ (например 16.05)")
@@ -874,49 +864,76 @@ async def admin_update_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_view_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Показать расписание для администратора.
+    Баг 6 исправлен: отображает текущую + следующие 2 недели,
+    показывает только слоты, время которых ещё не прошло.
+    """
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         await update.message.reply_text("У вас нет прав для этой команды.")
         return
 
+    now_tz = datetime.now(TIMEZONE)
     week_start = slot_manager.current_week_start
-    all_slots = db.get_all_slots_for_scheduling(week_start)
+    message = "📋 **Расписание (предстоящие слоты)**\n\n"
+    found_any = False
 
-    if not all_slots:
-        await update.message.reply_text("❌ Нет слотов на текущую неделю.")
-        return
+    for weeks_ahead in range(3):  # текущая неделя + 2 следующие
+        candidate_week = (
+            datetime.strptime(week_start, "%Y-%m-%d") + timedelta(weeks=weeks_ahead)
+        ).strftime("%Y-%m-%d")
 
-    smart = SmartScheduler(all_slots)
-    visible_ids = {s.id for s in smart.get_visible_slots()}
-
-    slots_by_day = {}
-    for slot in all_slots:
-        slots_by_day.setdefault(slot.day, []).append(slot)
-
-    message = f"📋 **Слоты на неделю {week_start}**\n\n"
-    # Все дни, которые есть в слотах, отсортированные по дате
-    days_order = sorted(slots_by_day.keys(), key=lambda d: min(s.date for s in slots_by_day[d]))
-
-    for day in days_order:
-        if day not in slots_by_day:
+        all_slots = db.get_all_slots_for_scheduling(candidate_week)
+        if not all_slots:
             continue
-        day_slots = sorted(slots_by_day[day], key=lambda s: s.base_time)
-        booked = sum(1 for s in day_slots if s.is_booked)
-        avail = len(day_slots) - booked
-        message += f"📅 **{day}** ({avail} свободно, {booked} занято):\n"
 
-        for slot in day_slots:
-            if slot.is_booked:
-                status = "❌"
-                booking = db.get_booking_by_slot_id(slot.id)
-                client = f" — {booking['user_name']}" if booking else ""
-                message += f"  {status} {slot.base_time} → {slot.current_time}{client}\n"
-            elif slot.id in visible_ids:
-                status = "✅"
-                message += f"  {status} {slot.base_time} → {slot.current_time}\n"
-            else:
-                message += f"  ⚠️ {slot.base_time} — недоступен\n"
+        # Пересчитываем позиции через SmartScheduler (обновляет current_time)
+        smart = SmartScheduler(all_slots)
+        visible_ids = {s.id for s in smart.get_visible_slots()}
+
+        # Фильтр: только слоты, время которых ещё не прошло
+        future_slots = [
+            s for s in all_slots
+            if datetime.strptime(f"{s.date} {s.current_time}", "%Y-%m-%d %H:%M")
+                       .replace(tzinfo=TIMEZONE) >= now_tz
+        ]
+        if not future_slots:
+            continue
+
+        found_any = True
+        ws_dt = datetime.strptime(candidate_week, "%Y-%m-%d")
+        we_dt = ws_dt + timedelta(days=6)
+        message += f"📆 **{ws_dt.strftime('%d.%m')} – {we_dt.strftime('%d.%m')}**\n"
+
+        slots_by_day: dict = {}
+        for slot in future_slots:
+            slots_by_day.setdefault(slot.day, []).append(slot)
+
+        days_order = sorted(slots_by_day.keys(), key=lambda d: min(s.date for s in slots_by_day[d]))
+
+        for day in days_order:
+            day_slots = sorted(slots_by_day[day], key=lambda s: s.current_time)
+            booked = sum(1 for s in day_slots if s.is_booked)
+            avail = sum(1 for s in day_slots if not s.is_booked and s.id in visible_ids)
+            date_label = _day_label(day, day_slots[0].date)
+            message += f"\n📅 **{date_label}** — {avail} своб., {booked} зан.:\n"
+
+            for slot in day_slots:
+                if slot.is_booked:
+                    booking = db.get_booking_by_slot_id(slot.id)
+                    client = f" — {booking['user_name']}" if booking else ""
+                    message += f"  ❌ {slot.base_time} → {slot.current_time}{client}\n"
+                elif slot.id in visible_ids:
+                    message += f"  ✅ {slot.base_time} → {slot.current_time}\n"
+                else:
+                    message += f"  ⚠️ {slot.base_time} — недоступен\n"
+
         message += "\n"
+
+    if not found_any:
+        await update.message.reply_text("📭 Нет предстоящих слотов на ближайшие 3 недели.")
+        return
 
     if len(message) > 4000:
         for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
@@ -957,16 +974,32 @@ async def admin_delete_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     day = DAY_ALIASES_DEL[day_key]
-    target_date = (
-        datetime.strptime(slot_manager.current_week_start, "%Y-%m-%d")
-        + timedelta(days=DAY_OFFSET[day])
-    ).strftime("%Y-%m-%d")
 
-    all_slots = db.get_all_slots_for_scheduling(slot_manager.current_week_start)
-    day_slots = [s for s in all_slots if s.date == target_date]
+    # Баг 6: ищем день в текущей и следующих 2 неделях — берём ближайший с слотами
+    week_start_base = slot_manager.current_week_start
+    target_date = None
+    day_slots = []
+    found_week = None
 
-    if not day_slots:
-        await update.message.reply_text(f"❌ На {day} ({target_date}) нет слотов.")
+    for weeks_ahead in range(3):
+        candidate_week = (
+            datetime.strptime(week_start_base, "%Y-%m-%d") + timedelta(weeks=weeks_ahead)
+        ).strftime("%Y-%m-%d")
+        candidate_date = (
+            datetime.strptime(candidate_week, "%Y-%m-%d")
+            + timedelta(days=DAY_OFFSET[day])
+        ).strftime("%Y-%m-%d")
+
+        candidate_slots = db.get_all_slots_for_scheduling(candidate_week)
+        candidate_day_slots = [s for s in candidate_slots if s.date == candidate_date]
+        if candidate_day_slots:
+            target_date = candidate_date
+            day_slots = candidate_day_slots
+            found_week = candidate_week
+            break
+
+    if not target_date:
+        await update.message.reply_text(f"❌ На {day} нет слотов в ближайшие 3 недели.")
         return
 
     has_bookings = any(s.is_booked for s in day_slots)

@@ -27,9 +27,9 @@ from telegram.ext import (
 
 from config import (
     BOT_TOKEN, ADMIN_IDS, TIMEZONE,
-    WELCOME_MESSAGE, BOOKING_START, BOOKING_CONFIRMED,
+    WELCOME_MESSAGE, BOOKING_START,
     ALREADY_BOOKED, NO_SLOTS_MESSAGE, MY_BOOKINGS_HEADER,
-    NO_BOOKINGS, BOOKING_CANCELLED, BOOKING_CHANGE_PROMPT,
+    NO_BOOKINGS,
     REMINDER_USER, REMINDER_ADMIN, ERROR_MESSAGE,
     BUTTON_BOOK, BUTTON_MY_BOOKINGS, BUTTON_CANCEL,
 )
@@ -598,8 +598,26 @@ async def execute_change_booking(query, context, booking_id: int):
     user_id = query.from_user.id
     booking = db.get_user_active_booking(user_id)
 
-    if booking and booking['booking_id'] == booking_id \
-            and db.cancel_booking_with_scheduler(user_id, booking_id):
+    if not booking or booking['booking_id'] != booking_id:
+        await query.edit_message_text("❌ Не удалось изменить запись.")
+        return
+
+    # Баг 1: повторная проверка 3ч — пользователь мог подтвердить кнопку
+    # спустя долгое время после того, как process_change_booking показал диалог.
+    if user_id not in ADMIN_IDS:
+        session_dt = datetime.strptime(
+            f"{booking['date']} {booking['time']}", "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=TIMEZONE)
+        if session_dt - datetime.now(TIMEZONE) < timedelta(hours=3):
+            await query.edit_message_text(
+                f"❌ Изменить запись больше нельзя.\n\n"
+                f"До сессии {booking['day']} в {booking['time']} "
+                f"осталось менее 3 часов.\n\n"
+                f"Для изменения свяжитесь напрямую: @n_kshmlv"
+            )
+            return
+
+    if db.cancel_booking_with_scheduler(user_id, booking_id):
         await query.edit_message_text(
             "✅ Текущая запись отменена.\n\nТеперь выберите новое время:"
         )
@@ -975,11 +993,10 @@ async def admin_delete_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     day = DAY_ALIASES_DEL[day_key]
 
-    # Баг 6: ищем день в текущей и следующих 2 неделях — берём ближайший с слотами
+    # Ищем день в текущей и следующих 2 неделях — берём ближайший с слотами
     week_start_base = slot_manager.current_week_start
     target_date = None
     day_slots = []
-    found_week = None
 
     for weeks_ahead in range(3):
         candidate_week = (
@@ -995,7 +1012,6 @@ async def admin_delete_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if candidate_day_slots:
             target_date = candidate_date
             day_slots = candidate_day_slots
-            found_week = candidate_week
             break
 
     if not target_date:
@@ -1035,13 +1051,20 @@ async def admin_view_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("У вас нет прав для этой команды.")
         return
 
-    bookings = db.get_all_bookings()
+    now_tz = datetime.now(TIMEZONE)
+    all_bookings = db.get_all_bookings()
+    # Показываем только предстоящие записи (прошедшие — уже состоялись)
+    bookings = [
+        b for b in all_bookings
+        if datetime.strptime(f"{b['date']} {b['time']}", "%Y-%m-%d %H:%M")
+               .replace(tzinfo=TIMEZONE) >= now_tz
+    ]
     if not bookings:
-        await update.message.reply_text("📭 Нет активных записей.")
+        await update.message.reply_text("📭 Нет предстоящих записей.")
         return
 
     bookings.sort(key=lambda x: (x['date'], x['time']))
-    message = "📋 ВСЕ АКТИВНЫЕ ЗАПИСИ:\n\n"
+    message = "📋 ПРЕДСТОЯЩИЕ ЗАПИСИ:\n\n"
     current_date = None
 
     for b in bookings:

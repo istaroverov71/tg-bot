@@ -32,7 +32,7 @@ DEFAULT_SLOTS = [
 ]
 
 # Admin IDs
-ADMIN_IDS = [649071882]  # Замените на свой Telegram ID
+ADMIN_IDS = [245217088]  # Замените на свой Telegram ID
 
 # ======== Сообщения ========
 

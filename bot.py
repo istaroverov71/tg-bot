@@ -148,38 +148,42 @@ async def show_booking_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # Ищем слоты на текущую И следующую неделю — берём все будущие
-    week_start = slot_manager.current_week_start
-    all_slots = db.get_all_slots_for_scheduling(week_start)
-
-    # Если на текущей неделе нет — ищем на следующей и далее
-    if not all_slots:
-        next_week = (
-            datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=7)
-        ).strftime("%Y-%m-%d")
-        all_slots = db.get_all_slots_for_scheduling(next_week)
-        if not all_slots:
-            # Ещё попробуем через 2 недели
-            week_after = (
-                datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=14)
-            ).strftime("%Y-%m-%d")
-            all_slots = db.get_all_slots_for_scheduling(week_after)
-
-    if not all_slots:
-        await reply(NO_SLOTS_MESSAGE, reply_markup=Keyboards.get_main_keyboard())
-        return
-
-    smart = SmartScheduler(all_slots)
-    visible_slots = smart.get_visible_slots()
-
-    # Пункт 4: скрываем прошедшие слоты и слоты ближайших 3 часов
+    # Ищем ближайшие доступные слоты, проверяя текущую и следующие 2 недели.
+    #
+    # Старая логика смотрела на следующую неделю ТОЛЬКО если в БД вообще нет строк
+    # для текущей недели. Это приводило к багу: в воскресенье вечером слоты текущей
+    # недели ещё есть в БД (пусть все прошедшие), поэтому `if not all_slots` = False,
+    # фильтр по времени срезал их все, и пользователь видел «все занято» —
+    # хотя admin только что залил новые слоты на следующую неделю.
+    #
+    # Исправление: перебираем недели до тех пор, пока не найдём хотя бы один
+    # видимый (будущий) слот.
     now_tz = datetime.now(TIMEZONE)
     cutoff = now_tz + timedelta(hours=3)
-    visible_slots = [
-        s for s in visible_slots
-        if datetime.strptime(f"{s.date} {s.current_time}", "%Y-%m-%d %H:%M")
-               .replace(tzinfo=TIMEZONE) >= cutoff
-    ]
+
+    week_start = slot_manager.current_week_start
+    all_slots: list = []
+    visible_slots: list = []
+
+    for weeks_ahead in range(3):  # текущая неделя + 2 следующие
+        candidate_week = (
+            datetime.strptime(week_start, "%Y-%m-%d") + timedelta(weeks=weeks_ahead)
+        ).strftime("%Y-%m-%d")
+        candidate_slots = db.get_all_slots_for_scheduling(candidate_week)
+        if not candidate_slots:
+            continue
+
+        smart_candidate = SmartScheduler(candidate_slots)
+        candidate_visible = smart_candidate.get_visible_slots()
+        candidate_visible = [
+            s for s in candidate_visible
+            if datetime.strptime(f"{s.date} {s.current_time}", "%Y-%m-%d %H:%M")
+                   .replace(tzinfo=TIMEZONE) >= cutoff
+        ]
+        if candidate_visible:
+            all_slots = candidate_slots
+            visible_slots = candidate_visible
+            break  # нашли неделю с будущими слотами — дальше не ищем
 
     if not visible_slots:
         await reply(NO_SLOTS_MESSAGE, reply_markup=Keyboards.get_main_keyboard())

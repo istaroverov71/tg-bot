@@ -282,40 +282,18 @@ class Database:
         self, date_str: str, day: str, week_start: str, new_times: List[str]
     ) -> dict:
         """
-        Обновить слоты на день БЕЗ потери существующих записей.
+        Добавить новые слоты к существующим на указанный день.
 
-        - Слоты, которые уже забронированы — оставляем нетронутыми.
-        - Свободные слоты, которых нет в new_times — удаляем.
-        - Новые времена, которых ещё нет — добавляем.
+        - Существующие слоты (свободные и занятые) не удаляются.
+        - Новые времена, которых ещё нет — добавляются.
         - Возвращает dict с информацией об изменениях.
         """
         with self.get_connection() as conn:
-            # Текущие слоты на день
+            # Существующие базовые времена (слоты не удаляем — только добавляем)
             existing = conn.execute('''
-                SELECT id, base_time, is_available, booked_by
-                FROM time_slots WHERE date = ?
-                ORDER BY base_time
+                SELECT base_time FROM time_slots WHERE date = ?
             ''', (date_str,)).fetchall()
-
-            booked_times = set()
-            free_slot_ids_to_delete = []
-
-            for row in existing:
-                slot_id, base_time, is_available, booked_by = row
-                if not is_available or booked_by is not None:
-                    # Занятый слот — сохраняем, запоминаем его время
-                    booked_times.add(base_time)
-                else:
-                    # Свободный слот — удалим если не в new_times
-                    if base_time not in new_times:
-                        free_slot_ids_to_delete.append(slot_id)
-
-            # Удаляем ненужные свободные слоты
-            for slot_id in free_slot_ids_to_delete:
-                conn.execute('DELETE FROM time_slots WHERE id = ?', (slot_id,))
-
-            # Существующие базовые времена (включая занятые)
-            existing_base_times = {r[1] for r in existing}
+            existing_base_times = {r[0] for r in existing}
 
             # Добавляем новые времена (которых ещё нет)
             added = []
@@ -331,10 +309,60 @@ class Database:
             conn.commit()
 
         return {
-            'preserved_bookings': list(booked_times),
-            'deleted_free_slots': len(free_slot_ids_to_delete),
+            'preserved_bookings': [],
+            'deleted_free_slots': 0,
             'added_slots': added,
         }
+
+    def delete_free_slots(self, date_str: str, times: List[str]) -> dict:
+        """
+        Удалить конкретные свободные слоты по дате и списку времён.
+
+        Для каждого времени:
+          - Слот не найден          → попадает в 'not_found'
+          - Есть активная запись    → попадает в 'booked' (не трогаем)
+          - Свободен                → удаляем (сначала чистим hist. записи по FK)
+
+        Возвращает: {'deleted': [...], 'booked': [...], 'not_found': [...]}
+        """
+        deleted = []
+        booked = []
+        not_found = []
+
+        with self.get_connection() as conn:
+            for t in times:
+                row = conn.execute(
+                    'SELECT id, is_available FROM time_slots WHERE date = ? AND base_time = ?',
+                    (date_str, t),
+                ).fetchone()
+
+                if not row:
+                    not_found.append(t)
+                    continue
+
+                slot_id, is_available = row
+
+                # Проверяем активную запись (cancelled/completed — не считаются)
+                active = conn.execute(
+                    "SELECT COUNT(*) FROM bookings WHERE slot_id = ? AND status = 'active'",
+                    (slot_id,),
+                ).fetchone()[0]
+
+                if active > 0:
+                    booked.append(t)
+                    continue
+
+                # Удаляем исторические записи (cancelled/completed) — иначе FK не даст
+                conn.execute(
+                    "DELETE FROM bookings WHERE slot_id = ? AND status IN ('cancelled', 'completed')",
+                    (slot_id,),
+                )
+                conn.execute('DELETE FROM time_slots WHERE id = ?', (slot_id,))
+                deleted.append(t)
+
+            conn.commit()
+
+        return {'deleted': deleted, 'booked': booked, 'not_found': not_found}
 
     def reset_week_slots(self, week_start: str) -> bool:
         with self.get_connection() as conn:

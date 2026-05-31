@@ -105,7 +105,7 @@ REMINDER_USER = """
 REMINDER_ADMIN = """
 👋🏻 Напоминание администратору:
 
-Через 15 минут сессия с {name} (@{username})
+Через 15 минут сессия с {name} ({username})
 Время: {slot}
 """
 

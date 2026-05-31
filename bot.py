@@ -698,7 +698,7 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
                     admin_id,
                     REMINDER_ADMIN.format(
                         name=session['name'],
-                        username=session.get('username') or '—',
+                        username=f"@{session['username']}" if session.get('username') else 'нет username',
                         slot=slot_str,
                     ),
                 )
@@ -1075,6 +1075,85 @@ async def admin_delete_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ошибка при удалении.")
 
 
+async def admin_delete_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /delete_slot ПТ 16.05 10:00,14:00
+    Удалить конкретные свободные слоты. Слоты с активными записями не удаляются.
+    """
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("У вас нет прав для этой команды.")
+        return
+
+    if not context.args or len(context.args) < 3:
+        await update.message.reply_text(
+            "🗑 Удаление конкретных слотов\n\n"
+            "Формат:\n"
+            "  /delete_slot ПТ 16.05 10:00,14:00\n\n"
+            "Дни: ПН ВТ СР ЧТ ПТ СБ ВСК\n"
+            "Занятые слоты удалить нельзя."
+        )
+        return
+
+    DAY_ALIASES = {
+        "пн": "Понедельник", "понедельник": "Понедельник",
+        "вт": "Вторник",     "вторник": "Вторник",
+        "ср": "Среда",       "среда": "Среда",
+        "чт": "Четверг",     "четверг": "Четверг",
+        "пт": "Пятница",     "пятница": "Пятница",
+        "сб": "Суббота",     "суббота": "Суббота",
+        "вск": "Воскресенье", "воскресенье": "Воскресенье",
+    }
+
+    day_key = context.args[0].lower().rstrip(".")
+    if day_key not in DAY_ALIASES:
+        await update.message.reply_text(
+            "❌ Неизвестный день. Используйте: ПН ВТ СР ЧТ ПТ СБ ВСК"
+        )
+        return
+    day_name = DAY_ALIASES[day_key]
+
+    date_raw = context.args[1]
+    times_raw = context.args[2]
+
+    try:
+        year = datetime.now(TIMEZONE).year
+        target_date_dt = datetime.strptime(f"{date_raw}.{year}", "%d.%m.%Y")
+        if target_date_dt.date() < datetime.now(TIMEZONE).date():
+            target_date_dt = datetime.strptime(f"{date_raw}.{year + 1}", "%d.%m.%Y")
+        target_date = target_date_dt.strftime("%Y-%m-%d")
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ Неверная дата '{date_raw}'. Формат: ДД.ММ (например 16.05)"
+        )
+        return
+
+    times = []
+    for t in times_raw.split(","):
+        t = t.strip()
+        try:
+            datetime.strptime(t, "%H:%M")
+            times.append(t)
+        except ValueError:
+            await update.message.reply_text(
+                f"❌ Неверное время '{t}'. Формат: ЧЧ:ММ"
+            )
+            return
+
+    result = db.delete_free_slots(target_date, times)
+    label = _day_label(day_name, target_date)
+
+    lines = []
+    if result['deleted']:
+        lines.append(f"✅ Удалены: {', '.join(result['deleted'])}")
+    if result['booked']:
+        lines.append(f"❌ Заняты, не удалены: {', '.join(result['booked'])}")
+    if result['not_found']:
+        lines.append(f"⚠️ Не найдены: {', '.join(result['not_found'])}")
+
+    await update.message.reply_text(f"🗑 {label}\n\n" + "\n".join(lines))
+
+
 async def admin_view_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -1190,6 +1269,7 @@ def main():
     application.add_handler(CommandHandler("update_week", admin_update_week))
     application.add_handler(CommandHandler("view_slots", admin_view_slots))
     application.add_handler(CommandHandler("delete_day", admin_delete_day))
+    application.add_handler(CommandHandler("delete_slot", admin_delete_slot))
     application.add_handler(CommandHandler("view_all", admin_view_all))
     application.add_handler(CommandHandler("broadcast", admin_broadcast))
 
@@ -1219,7 +1299,7 @@ def main():
     print("🤖 БОТ ЗАПУЩЕН")
     print("=" * 50)
     print(f"👑 Админ ID: {ADMIN_IDS[0] if ADMIN_IDS else 'не задан'}")
-    print("📋 /start /myid /update_week /view_slots /delete_day /view_all /broadcast")
+    print("📋 /start /myid /update_week /view_slots /delete_day /delete_slot /view_all /broadcast")
     print("=" * 50)
 
     application.run_polling()

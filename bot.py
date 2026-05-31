@@ -374,7 +374,7 @@ async def show_booking_confirmation(query, context, slot_id: int):
         slot_db = db.get_slot_by_id(slot_id)
         if not slot_db:
             await query.edit_message_text(
-                "❌ Слот не найден или уже занят. Пожалуйста, начните выбор заново."
+                "К сожалению, этот слот уже занят или недоступен. Выберите другое время — нажмите «✍🏻 Запись» в главном меню."
             )
             return
         # Перезагружаем всю неделю и пересчитываем через SmartScheduler
@@ -384,7 +384,7 @@ async def show_booking_confirmation(query, context, slot_id: int):
         target_slot = next((s for s in visible_fresh if s.id == slot_id), None)
         if not target_slot:
             await query.edit_message_text(
-                "❌ Этот слот уже занят или недоступен. Пожалуйста, выберите другое время."
+                "К сожалению, этот слот уже занят или недоступен. Выберите другое время — нажмите «✍🏻 Запись» в главном меню."
             )
             return
         # Восстанавливаем контекст для последующих шагов
@@ -483,7 +483,9 @@ async def process_final_booking(query, context, slot_id: int):
         context.user_data.pop('visible_slots', None)
         context.user_data.pop('all_slots', None)
     else:
-        await query.edit_message_text(f"❌ {message}")
+        await query.edit_message_text(
+            f"К сожалению, этот слот только что заняли. Выберите другое время — нажмите «✍🏻 Запись» в главном меню."
+        )
 
 
 async def process_cancellation(query, context, booking_id: int):

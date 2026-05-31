@@ -446,8 +446,7 @@ async def process_final_booking(query, context, slot_id: int):
             admin_message = (
                 f"📝 Новая запись!\n\n"
                 f"👤 Клиент: {first} {last}\n"
-                f"📱 Username: {uname}\n"
-                f"🆔 ID: {user.id}\n\n"
+                f"📱 Username: {uname}\n\n"
                 f"📅 Слот: {_dl} в {display_time}"
             )
             for admin_id in ADMIN_IDS:
@@ -509,8 +508,7 @@ async def process_cancellation(query, context, booking_id: int):
                 cancel_msg = (
                     f"❌ Запись отменена\n\n"
                     f"👤 Клиент: {first} {last}\n"
-                    f"📱 Username: {uname}\n"
-                    f"🆔 ID: {user_id}"
+                    f"📱 Username: {uname}"
                     f"{slot_info_str}"
                 )
                 await context.bot.send_message(admin_id, cancel_msg)
@@ -632,8 +630,7 @@ async def execute_change_booking(query, context, booking_id: int):
         change_msg = (
             f"✏️ Перенос записи (старый слот отменён)\n\n"
             f"👤 Клиент: {first} {last}\n"
-            f"📱 Username: {uname}\n"
-            f"🆔 ID: {user_id}\n\n"
+            f"📱 Username: {uname}\n\n"
             f"📅 Отменён: {dl} в {booking['time']}\n"
             f"⏳ Клиент выбирает новое время..."
         )

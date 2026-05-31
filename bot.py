@@ -622,6 +622,27 @@ async def execute_change_booking(query, context, booking_id: int):
         await query.edit_message_text(
             "✅ Текущая запись отменена.\n\nТеперь выберите новое время:"
         )
+
+        # Уведомляем администратора об отмене в рамках переноса
+        user = query.from_user
+        first = user.first_name or ''
+        last  = user.last_name  or ''
+        uname = f"@{user.username}" if user.username else 'нет username'
+        dl    = _day_label(booking['day'], booking['date'])
+        change_msg = (
+            f"✏️ Перенос записи (старый слот отменён)\n\n"
+            f"👤 Клиент: {first} {last}\n"
+            f"📱 Username: {uname}\n"
+            f"🆔 ID: {user_id}\n\n"
+            f"📅 Отменён: {dl} в {booking['time']}\n"
+            f"⏳ Клиент выбирает новое время..."
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(admin_id, change_msg)
+            except Exception as e:
+                logger.error(f"❌ Не удалось уведомить админа {admin_id} о переносе: {e}")
+
         await show_booking_days(query, context)
     else:
         await query.edit_message_text("❌ Не удалось изменить запись.")

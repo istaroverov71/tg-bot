@@ -16,6 +16,7 @@ import logging
 from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Forbidden
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -662,6 +663,10 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
             )
             user_sent = True
             logger.info(f"Reminder sent to user {session['user_id']}")
+        except Forbidden:
+            # Пользователь заблокировал бота — деактивируем, не пробуем снова
+            db.deactivate_user(session['user_id'])
+            logger.warning(f"User {session['user_id']} blocked the bot — deactivated")
         except Exception as e:
             logger.error(f"Failed to send reminder to user {session['user_id']}: {e}")
             db.reset_notification_for_booking(session['booking_id'])
@@ -862,16 +867,23 @@ async def admin_update_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + "\n\nНажмите «✍🏻 Запись» чтобы забронировать время."
         )
         sent = 0
+        blocked = 0
         failed_details = []
         for u in users_to_notify:
             try:
                 await context.bot.send_message(u["user_id"], notif_text)
                 sent += 1
                 logger.info(f"✅ Уведомление отправлено {u['user_id']} ({u['first_name']})")
+            except Forbidden:
+                blocked += 1
+                db.deactivate_user(u["user_id"])
+                logger.warning(f"User {u['user_id']} ({u['first_name']}) заблокировал бота — деактивирован")
             except Exception as e:
                 failed_details.append(f"{u['first_name']} (id={u['user_id']}): {e}")
                 logger.warning(f"Не удалось уведомить {u['user_id']}: {e}")
         result_msg = f"📣 Уведомлено {sent} из {len(users_to_notify)} пользователей."
+        if blocked:
+            result_msg += f"\n🚫 Заблокировали бота: {blocked} (деактивированы)"
         if failed_details:
             result_msg += "\n\n❌ Ошибки:\n" + "\n".join(failed_details)
         await update.message.reply_text(result_msg)
@@ -1100,7 +1112,7 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = db.get_all_users()
     await update.message.reply_text(f"⏳ Отправка {len(users)} пользователям...")
 
-    sent = failed = 0
+    sent = failed = blocked = 0
     for user in users:
         try:
             await context.bot.send_message(
@@ -1109,13 +1121,37 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown',
             )
             sent += 1
+        except Forbidden:
+            blocked += 1
+            db.deactivate_user(user['user_id'])
+            logger.warning(f"Broadcast: user {user['user_id']} заблокировал бота — деактивирован")
         except Exception as e:
             failed += 1
             logger.error(f"Broadcast failed for {user['user_id']}: {e}")
 
-    await update.message.reply_text(
-        f"✅ Рассылка завершена!\n• Отправлено: {sent}\n• Не доставлено: {failed}",
-        parse_mode='Markdown',
+    report = f"✅ Рассылка завершена!\n• Отправлено: {sent}"
+    if blocked:
+        report += f"\n• Заблокировали бота: {blocked} (деактивированы)"
+    if failed:
+        report += f"\n• Другие ошибки: {failed}"
+    await update.message.reply_text(report, parse_mode='Markdown')
+
+
+# ========== ОЧИСТКА СТАРЫХ ДАННЫХ ==========
+
+async def run_cleanup(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ежедневная задача:
+      1. Переводит прошедшие активные сессии в статус 'completed'
+         (без этого они мешают cleanup и статистике).
+      2. Удаляет записи и слоты старше 4 недель (cancelled/completed).
+    """
+    completed = db.complete_past_sessions()
+    result = db.cleanup_old_data(weeks_to_keep=4)
+    logger.info(
+        f"Daily cleanup: завершено прошедших сессий={completed}, "
+        f"удалено записей={result['deleted_bookings']}, "
+        f"слотов={result['deleted_slots']}"
     )
 
 
@@ -1147,12 +1183,18 @@ def main():
 
     application.add_error_handler(error_handler)
 
-    # ИСПРАВЛЕНО: напоминания через PTB job_queue (не APScheduler с args=[bot])
-    # job_queue передаёт правильный context с context.bot автоматически
+    # Напоминания: каждые 5 минут
     application.job_queue.run_repeating(
         send_reminders,
-        interval=300,   # каждые 5 минут
-        first=10,       # первый запуск через 10 сек после старта
+        interval=300,
+        first=10,
+    )
+
+    # Ежедневная очистка: завершить прошедшие сессии + удалить старые данные
+    application.job_queue.run_repeating(
+        run_cleanup,
+        interval=86400,   # раз в сутки
+        first=60,         # первый запуск через 60 сек после старта
     )
 
     print("=" * 50)

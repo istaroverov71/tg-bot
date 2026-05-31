@@ -511,6 +511,107 @@ def test_9_cancel_cutoff_and_messages():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ТЕСТ 10: Деактивация пользователей, заблокировавших бота
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_10_deactivate_blocked_users():
+    sep("ТЕСТ 10: Деактивация пользователей, заблокировавших бота")
+    db = fresh_db()
+
+    # Оба пользователя активны после регистрации
+    all_users = db.get_all_users()
+    ids = {u['user_id'] for u in all_users}
+    assert USER_A in ids and USER_B in ids, "Оба пользователя должны быть в списке"
+    print("✅ Оба пользователя активны после регистрации")
+
+    # USER_A заблокировал бота
+    ok = db.deactivate_user(USER_A)
+    assert ok, "deactivate_user должен вернуть True"
+    print(f"✅ USER_A деактивирован (заблокировал бота)")
+
+    # get_all_users (используется в /broadcast) — USER_A исчезает
+    active = db.get_all_users()
+    active_ids = {u['user_id'] for u in active}
+    assert USER_A not in active_ids, "USER_A не должен быть в get_all_users"
+    assert USER_B in active_ids,     "USER_B должен оставаться активным"
+    print("✅ get_all_users (для /broadcast) больше не включает USER_A")
+
+    # get_users_without_booking_on_week (для рассылки о слотах) — тоже не включает
+    monday, sunday = "2099-01-06", "2099-01-12"
+    to_notify = db.get_users_without_booking_on_week(monday, sunday)
+    notify_ids = {u['user_id'] for u in to_notify}
+    assert USER_A not in notify_ids, "Деактивированный USER_A не должен получать рассылки"
+    assert USER_B in notify_ids,     "USER_B (активный) должен получать рассылки"
+    print("✅ Деактивированный USER_A исключён из рассылок о новых слотах")
+
+    # При следующем /start is_active восстанавливается в 1
+    db.add_user(USER_A, 'client1', 'Иван', None)
+    restored = db.get_all_users()
+    restored_ids = {u['user_id'] for u in restored}
+    assert USER_A in restored_ids, "После /start USER_A снова активен"
+    print("✅ После /start (add_user) USER_A снова активен — is_active=1 восстановлен")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ТЕСТ 11: Ежедневная очистка (cleanup) — логика
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_11_cleanup_logic():
+    sep("ТЕСТ 11: Ежедневная очистка старых данных")
+    db = fresh_db()
+
+    # Добавляем «старые» слоты и запись (неделя 6 недель назад)
+    from datetime import date
+    old_monday = (date.today() - timedelta(weeks=6))
+    old_monday -= timedelta(days=old_monday.weekday())   # сдвигаем на понедельник
+    old_week = old_monday.strftime("%Y-%m-%d")
+    old_date = old_monday.strftime("%Y-%m-%d")
+
+    add_slot_raw(701, "10:00", date=old_date, week_start=old_week)
+
+    # Создаём «завершённую» запись (статус completed) напрямую в БД
+    conn = sqlite3.connect(_TMP_DB)
+    conn.execute('''
+        INSERT INTO bookings
+            (user_id, slot_id, original_time, adjusted_time, booking_date, status)
+        VALUES (?,?,?,?,?,?)
+    ''', (USER_A, 701, "10:00", "10:00",
+          (datetime.now(TIMEZONE) - timedelta(weeks=6)).isoformat(), 'completed'))
+    conn.commit()
+    conn.close()
+
+    # Убеждаемся что данные есть
+    before_slots    = _raw("SELECT COUNT(*) FROM time_slots WHERE week_start=?", (old_week,))[0][0]
+    before_bookings = _raw("SELECT COUNT(*) FROM bookings WHERE status='completed'"  )[0][0]
+    assert before_slots >= 1,    "Старый слот должен быть в БД"
+    assert before_bookings >= 1, "Старая завершённая запись должна быть в БД"
+    print(f"✅ До очистки: {before_slots} старых слотов, {before_bookings} завершённых записей")
+
+    # Запускаем очистку (weeks_to_keep=4 → удалим всё старше 4 недель)
+    completed = db.complete_past_sessions()   # как в run_cleanup
+    result = db.cleanup_old_data(weeks_to_keep=4)
+    assert result['deleted_slots'] >= 1,    f"Старые слоты должны быть удалены: {result}"
+    assert result['deleted_bookings'] >= 1, f"Старые записи должны быть удалены: {result}"
+    print(f"✅ Удалено: {result['deleted_slots']} слотов, {result['deleted_bookings']} записей")
+
+    # Новые данные (на следующей неделе) должны остаться нетронутыми
+    add_slot_raw(702, "10:00")   # WEEK = 2099-01-06 — останется
+    db.book_slot_with_scheduler(USER_A, 702, WEEK)
+    db.cleanup_old_data(weeks_to_keep=4)
+    active = db.get_user_active_booking(USER_A)
+    assert active is not None, "Свежая запись не должна удаляться при очистке"
+    print("✅ Свежие данные (2099) не затронуты очисткой")
+
+    # Статический анализ: run_cleanup и job зарегистрированы в bot.py
+    bot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot.py')
+    src = open(bot_path, encoding='utf-8').read()
+    assert 'run_cleanup' in src,        "run_cleanup должна быть в bot.py"
+    assert 'cleanup_old_data' in src,   "cleanup_old_data должна вызываться"
+    assert 'interval=86400' in src,     "Очистка должна запускаться раз в сутки (86400 сек)"
+    print("✅ run_cleanup зарегистрирован в job_queue с interval=86400 (раз в сутки)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Запуск
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -525,9 +626,11 @@ if __name__ == '__main__':
         test_7_past_slots_hidden()
         test_8_booking_cutoff_3h()
         test_9_cancel_cutoff_and_messages()
+        test_10_deactivate_blocked_users()
+        test_11_cleanup_logic()
 
         print("\n" + "="*58)
-        print("  🎉  Все 9 тестовых сценариев пройдены!")
+        print("  🎉  Все 11 тестовых сценариев пройдены!")
         print("="*58)
     finally:
         if os.path.exists(_TMP_DB):

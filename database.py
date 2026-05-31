@@ -76,6 +76,11 @@ class Database:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings(user_id, status)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookings_notified ON bookings(notified_15min)')
 
+            # Миграция: добавляем is_active если колонки ещё нет (идемпотентно)
+            existing_cols = [row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()]
+            if 'is_active' not in existing_cols:
+                cursor.execute('ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1')
+
             conn.commit()
 
     # ============================
@@ -86,9 +91,14 @@ class Database:
                  first_name: str, last_name: Optional[str]):
         with self.get_connection() as conn:
             conn.execute('''
-                INSERT OR REPLACE INTO users
-                (user_id, username, first_name, last_name, registered_date)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO users
+                    (user_id, username, first_name, last_name, registered_date, is_active)
+                VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username       = excluded.username,
+                    first_name     = excluded.first_name,
+                    last_name      = excluded.last_name,
+                    is_active      = 1
             ''', (user_id, username, first_name, last_name,
                   datetime.now(TIMEZONE).isoformat()))
             conn.commit()
@@ -107,15 +117,32 @@ class Database:
         return None
 
     def get_all_users(self) -> List[dict]:
+        """Только активные пользователи (не заблокировавшие бота)."""
         with self.get_connection() as conn:
             rows = conn.execute('''
                 SELECT user_id, username, first_name, last_name, registered_date
-                FROM users ORDER BY registered_date DESC
+                FROM users
+                WHERE is_active = 1
+                ORDER BY registered_date DESC
             ''').fetchall()
         return [
             dict(zip(['user_id', 'username', 'first_name', 'last_name', 'registered_date'], r))
             for r in rows
         ]
+
+    def deactivate_user(self, user_id: int) -> bool:
+        """
+        Пометить пользователя как неактивного (заблокировал бота).
+        Такой пользователь исключается из всех рассылок и напоминаний.
+        При следующем /start is_active автоматически вернётся в 1.
+        """
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                'UPDATE users SET is_active = 0 WHERE user_id = ?',
+                (user_id,)
+            )
+            conn.commit()
+            return cur.rowcount > 0
 
     # ============================
     # СЛОТЫ
@@ -583,7 +610,8 @@ class Database:
             rows = conn.execute('''
                 SELECT u.user_id, u.first_name, u.username
                 FROM users u
-                WHERE u.user_id NOT IN (
+                WHERE u.is_active = 1
+                  AND u.user_id NOT IN (
                     SELECT b.user_id FROM bookings b
                     JOIN time_slots ts ON b.slot_id = ts.id
                     WHERE b.status = 'active'

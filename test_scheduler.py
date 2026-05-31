@@ -59,7 +59,11 @@ def test_a_via_book_slot():
 
 
 def test_b_no_shift_if_gap_ok():
-    """Сценарий Б: 13:00 занят, 15:00 свободен — 15:00 остаётся на месте"""
+    """Сценарий Б: 13:00 занят → 14:00 сдвигается на 14:10; 15:00 остаётся на месте.
+
+    Слот двигается ТОЛЬКО если рядом есть активная запись.
+    15:00 свободен, а его сосед слева (14:00) тоже свободен — каскада нет.
+    """
     slots = [make_slot(1, "13:00"), make_slot(2, "14:00"), make_slot(3, "15:00")]
     s = SmartScheduler(slots)
     s.book_slot(1, 100)  # бронируем 13:00
@@ -69,9 +73,8 @@ def test_b_no_shift_if_gap_ok():
     s.get_visible_slots()  # обновляем current_time
 
     assert slot2.current_time == "14:10", f"slot2: {slot2.current_time}"
-    # slot3 (15:00): от 14:10 до 15:00 = 50 мин < 70 мин (MIN_GAP)
-    # значит 15:00 должен сдвинуться вперёд: 14:10 + 70 = 15:20
-    assert slot3.current_time == "15:20", f"slot3: {slot3.current_time}"
+    # slot3 (15:00): ближайший занятый слева — 13:00; min_start=14:10 < 15:00 → не сдвигается
+    assert slot3.current_time == "15:00", f"slot3: {slot3.current_time}"
     print(f"✅ Сценарий Б: slot2={slot2.current_time}, slot3={slot3.current_time}")
 
 
@@ -104,16 +107,17 @@ def test_c_backward_shift():
 
 
 def test_d_chain():
-    """Сценарий Г: каскадные сдвиги вперёд.
+    """Сценарий Г: сдвиг только у непосредственных соседей занятого слота.
 
     Слоты: id=1→10:00, id=2→11:00 (занят), id=3→12:00, id=4→13:00, id=5→14:00
     После бронирования 11:00 (id=2):
-      id=1 (10:00): только занятый справа (11:00) → max_start = 11:00 - 70 = 9:50
-                    min(10:00, 9:50) = 9:50
-      id=3 (12:00): только занятый слева (11:00)  → min_start = 11:00 + 70 = 12:10
-                    max(12:00, 12:10) = 12:10
-      id=4 (13:00): каскад от id=3 (12:10)        → min_start = 12:10 + 70 = 13:20
-      id=5 (14:00): каскад от id=4 (13:20)        → min_start = 13:20 + 70 = 14:30
+      id=1 (10:00): занятый справа (11:00) → max_start = 11:00 - 70 = 9:50 → сдвиг назад
+      id=3 (12:00): занятый слева  (11:00) → min_start = 11:00 + 70 = 12:10 → сдвиг вперёд
+      id=4 (13:00): ближайший занятый слева — 11:00; min_start=12:10 < 13:00 → БЕЗ сдвига
+      id=5 (14:00): аналогично → БЕЗ сдвига
+
+    Правило: свободный слот не передаёт ограничение следующему.
+    Только активная запись рядом двигает соседний свободный слот.
     """
     slots = [make_slot(i, f"{9+i}:00") for i in range(1, 6)]
     # Бронируем id=2 (base_time = "11:00")
@@ -128,13 +132,11 @@ def test_d_chain():
     print(f"  Слот id=5 (14:00): {times.get(5)}")
 
     assert times.get(1) == "09:50", f"slot1: {times.get(1)}"
-    # После бронирования 11:00 слот 12:00 сдвигается: 11:00 + 70 = 12:10
     assert times.get(3) == "12:10", f"slot3: {times.get(3)}"
-    # Каскад: 12:10 + 70 = 13:20
-    assert times.get(4) == "13:20", f"slot4: {times.get(4)}"
-    # Каскад: 13:20 + 70 = 14:30
-    assert times.get(5) == "14:30", f"slot5: {times.get(5)}"
-    print("✅ Сценарий Г: каскадные сдвиги — OK")
+    # id=4 и id=5 остаются на базовых временах — нет активных записей рядом
+    assert times.get(4) == "13:00", f"slot4: {times.get(4)}"
+    assert times.get(5) == "14:00", f"slot5: {times.get(5)}"
+    print("✅ Сценарий Г: только непосредственные соседи сдвигаются — OK")
 
 
 def test_cancel_restores():
@@ -153,6 +155,38 @@ def test_cancel_restores():
     print("✅ Отмена: слоты вернулись на базовое время")
 
 
+def test_gap_uses_current_time():
+    """Баг 1: разрыв между сессиями должен считаться от current_time забронированного слота.
+
+    10:00 занят → 11:00 сдвигается на 11:10.
+    Затем 11:10 занят (base=11:00, current=11:10).
+    → 12:00 должен стать 12:20 (11:10 + 70), а не 12:10 (11:00 + 70).
+    """
+    slots = [make_slot(1, "10:00"), make_slot(2, "11:00"), make_slot(3, "12:00")]
+    s = SmartScheduler(slots)
+
+    # Бронируем 10:00
+    ok, t1, _ = s.book_slot(1, 100)
+    assert ok and t1 == "10:00"
+
+    # Обновляем current_time через get_visible_slots, как это делает бот
+    visible = s.get_visible_slots()
+    slot2 = s.find_slot_by_id(2)
+    assert slot2.current_time == "11:10", f"После первой записи slot2={slot2.current_time}"
+
+    # Бронируем 11:10 (slot id=2, base=11:00, current=11:10)
+    ok, t2, _ = s.book_slot(2, 101)
+    assert ok and t2 == "11:10", f"Подтверждённое время: {t2}"
+
+    # Проверяем: 12:00 должен сдвинуться на 12:20, а не на 12:10
+    visible = s.get_visible_slots()
+    slot3 = s.find_slot_by_id(3)
+    assert slot3.current_time == "12:20", (
+        f"Ожидали 12:20 (11:10+70), получили {slot3.current_time}"
+    )
+    print(f"✅ Баг 1 (current_time): slot3={slot3.current_time}")
+
+
 if __name__ == "__main__":
     test_a_forward_shift()
     test_a_via_book_slot()
@@ -160,4 +194,5 @@ if __name__ == "__main__":
     test_c_backward_shift()
     test_d_chain()
     test_cancel_restores()
+    test_gap_uses_current_time()
     print("\n🎉 Все тесты пройдены!")

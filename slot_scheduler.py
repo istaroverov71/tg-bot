@@ -225,10 +225,13 @@ class SmartScheduler:
         # Результирующие времена; для занятых — base_time, для свободных — вычисляем
         result_dt: List[Optional[datetime]] = [None] * n
 
-        # Фиксируем занятые
+        # Фиксируем занятые: используем current_time (подтверждённое/сдвинутое время)
+        # Баг 1: раньше стояло base_dt[i] — из-за этого следующий свободный слот
+        # считал min_start от 11:00 (базы), а не от 11:10 (реального времени записи),
+        # и разрыв между соседними сессиями получался 60 мин вместо 70.
         for i, slot in enumerate(day_slots):
             if slot.is_booked:
-                result_dt[i] = base_dt[i]
+                result_dt[i] = datetime.strptime(slot.current_time, "%H:%M")
 
         # Вычисляем свободные
         for i, slot in enumerate(day_slots):
@@ -285,42 +288,6 @@ class SmartScheduler:
                     clamped = max(min_start, min(base, max_start))
                     result_dt[i] = clamped
 
-        # Каскадный проход вперёд: если свободный слот X был сдвинут из-за занятого слота,
-        # следующий свободный слот X+1 тоже должен отступить на MIN_GAP от нового времени X.
-        #
-        # Важно: каскад запускается ТОЛЬКО если предшественник:
-        #   a) занят (всегда создаёт ограничение), или
-        #   b) свободен, но БЫЛ сдвинут (result ≠ base).
-        # Свободный слот, стоящий на базовом времени, каскад не запускает —
-        # иначе после отмены брони слоты не возвращались бы на исходные позиции.
-        for i in range(1, n):
-            if result_dt[i] is None or day_slots[i].is_booked:
-                continue
-            for j in range(i - 1, -1, -1):
-                if result_dt[j] is not None:
-                    prev_is_booked = day_slots[j].is_booked
-                    prev_was_shifted = (result_dt[j] != base_dt[j])
-                    if not prev_is_booked and not prev_was_shifted:
-                        # Предшественник свободен и на базовом месте — каскад не нужен
-                        break
-                    min_start_cascade = result_dt[j] + timedelta(minutes=MIN_GAP)
-                    if result_dt[i] < min_start_cascade:
-                        # Проверяем правую границу (ближайший занятый справа)
-                        right_booked_idx: Optional[int] = None
-                        for k in range(i + 1, n):
-                            if day_slots[k].is_booked:
-                                right_booked_idx = k
-                                break
-                        if right_booked_idx is not None:
-                            max_start = result_dt[right_booked_idx] - timedelta(minutes=MIN_GAP)
-                            if min_start_cascade > max_start:
-                                result_dt[i] = None  # нет места после каскадного сдвига
-                            else:
-                                result_dt[i] = min_start_cascade
-                        else:
-                            result_dt[i] = min_start_cascade
-                    break  # нашли ближайшего предшественника — выходим
-
         # Формируем результат: только доступные (не None, не занятые)
         day_result: Dict[int, str] = {}
         for i, slot in enumerate(day_slots):
@@ -364,13 +331,14 @@ class SmartScheduler:
         if target.is_booked:
             return False, "Слот уже занят", None
 
-        # Проверка: нельзя создавать цепочку из 3 занятых слотов подряд по времени.
-        # Для администратора проверка не применяется.
+        # Бизнес-правило: максимум 3 сессии подряд (4-я подряд — запрещена).
         # "Подряд" = разрыв между началами двух соседних сессий <= MIN_GAP (70 мин).
-        # Если хотя бы один разрыв в тройке > MIN_GAP — цепочка разорвана, разрешено.
+        # Ищем четвёрку: если ВСЕ 3 разрыва <= MIN_GAP — 4-я запись создаёт цепочку из 4.
+        # Для администратора проверка не применяется.
         # Примеры:
-        #   12:00, 13:10, 14:20 → разрывы 70 и 70 → оба <= 70 → ЗАПРЕЩЕНО
-        #   12:00, 13:10, 15:00 → разрывы 70 и 110 → второй > 70 → РАЗРЕШЕНО
+        #   10:00, 11:10, 12:20, 13:30 → разрывы 70,70,70 → ЗАПРЕЩЕНО (4-я в ряд)
+        #   10:00, 11:10, 12:20         → разрывы 70,70    → РАЗРЕШЕНО  (3-я в ряд, ОК)
+        #   10:00, 11:10, 13:00, 14:10 → разрыв 110 в середине → разорвана → РАЗРЕШЕНО
 
         if not is_admin:
             same_day_booked = sorted(
@@ -385,20 +353,22 @@ class SmartScheduler:
             )
             hyp_times = [datetime.strptime(s.base_time, "%H:%M") for s in hypothetical]
 
-            # Ищем тройку где ОБА разрыва <= MIN_GAP
-            for i in range(len(hyp_times) - 2):
+            # Ищем четвёрку где ВСЕ 3 разрыва <= MIN_GAP
+            for i in range(len(hyp_times) - 3):
                 gap1 = (hyp_times[i+1] - hyp_times[i]).total_seconds() / 60
                 gap2 = (hyp_times[i+2] - hyp_times[i+1]).total_seconds() / 60
-                if gap1 <= MIN_GAP and gap2 <= MIN_GAP:
+                gap3 = (hyp_times[i+3] - hyp_times[i+2]).total_seconds() / 60
+                if gap1 <= MIN_GAP and gap2 <= MIN_GAP and gap3 <= MIN_GAP:
                     slots_in_chain = {
                         hypothetical[i].base_time,
                         hypothetical[i+1].base_time,
-                        hypothetical[i+2].base_time
+                        hypothetical[i+2].base_time,
+                        hypothetical[i+3].base_time,
                     }
                     if target.base_time in slots_in_chain:
                         return False, (
-                            "❌ Нельзя записаться: три сессии подряд слишком близко друг к другу.\n\n"
-                            "Между этой записью и соседними сессиями недостаточно перерыва."
+                            "❌ Нельзя записаться: четыре сессии подряд слишком близко друг к другу.\n\n"
+                            "Максимум 3 сессии подряд без перерыва."
                         ), None
 
         # Запоминаем время, которое видел пользователь при выборе (баг 9: ранее возвращался base_time)

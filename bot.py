@@ -268,10 +268,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if data == "back_to_main":
+            # Редактируем текущее сообщение — не создаём новое.
+            # ReplyKeyboardMarkup «липкая»: она установлена через /start
+            # и остаётся видна без повторной отправки.
             await query.edit_message_text(WELCOME_MESSAGE, reply_markup=None)
-            await query.message.reply_text(
-                "Главное меню:", reply_markup=Keyboards.get_main_keyboard()
-            )
 
         elif data == "back_to_days":
             visible_slots = context.user_data.get('visible_slots', [])

@@ -31,7 +31,7 @@ from config import (
     WELCOME_MESSAGE, BOOKING_START,
     ALREADY_BOOKED, NO_SLOTS_MESSAGE, MY_BOOKINGS_HEADER,
     NO_BOOKINGS,
-    REMINDER_USER, REMINDER_ADMIN, ERROR_MESSAGE,
+    REMINDER_USER, REMINDER_USER_24H, REMINDER_ADMIN, ERROR_MESSAGE,
     BUTTON_BOOK, BUTTON_MY_BOOKINGS, BUTTON_CANCEL,
 )
 from database import Database
@@ -661,10 +661,31 @@ async def force_delete_day(query, context, date_str: str):
 
 async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     """
-    Отправить напоминания о сессиях, которые начнутся через 15 минут.
-    Вызывается через job_queue PTB — context.bot доступен автоматически.
+    Отправить напоминания:
+      — за 24 часа: клиенту (текст об оплате и правиле отмены)
+      — за 15 минут: клиенту + администратору
+    Вызывается через job_queue PTB каждые 5 минут.
     """
     logger.info("Checking reminders...")
+
+    # ── Напоминания за 24 часа (только клиенту) ──────────────────────────────
+    upcoming_24h = db.get_upcoming_sessions_24h()
+    for session in upcoming_24h:
+        slot_str = f"{session['day']} в {session['time']}"
+        try:
+            await context.bot.send_message(
+                session['user_id'],
+                REMINDER_USER_24H.format(slot=slot_str),
+            )
+            logger.info(f"24h reminder sent to user {session['user_id']}")
+        except Forbidden:
+            db.deactivate_user(session['user_id'])
+            logger.warning(f"User {session['user_id']} blocked the bot — deactivated (24h reminder)")
+        except Exception as e:
+            logger.error(f"Failed to send 24h reminder to user {session['user_id']}: {e}")
+            db.reset_24h_notification_for_booking(session['booking_id'])
+
+    # ── Напоминания за 15 минут (клиенту + администратору) ───────────────────
     upcoming = db.get_upcoming_sessions(minutes_before=15)
 
     for session in upcoming:

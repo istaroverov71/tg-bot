@@ -66,6 +66,7 @@ class Database:
                     booking_date TEXT NOT NULL,
                     status TEXT DEFAULT 'active',
                     notified_15min INTEGER DEFAULT 0,
+                    notified_24h INTEGER DEFAULT 0,
                     FOREIGN KEY (user_id) REFERENCES users (user_id),
                     FOREIGN KEY (slot_id) REFERENCES time_slots (id)
                 )
@@ -76,10 +77,14 @@ class Database:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings(user_id, status)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookings_notified ON bookings(notified_15min)')
 
-            # Миграция: добавляем is_active если колонки ещё нет (идемпотентно)
-            existing_cols = [row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()]
-            if 'is_active' not in existing_cols:
+            # Миграции (идемпотентные — безопасно запускать на существующей БД)
+            existing_user_cols = [row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()]
+            if 'is_active' not in existing_user_cols:
                 cursor.execute('ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1')
+
+            existing_booking_cols = [row[1] for row in cursor.execute("PRAGMA table_info(bookings)").fetchall()]
+            if 'notified_24h' not in existing_booking_cols:
+                cursor.execute('ALTER TABLE bookings ADD COLUMN notified_24h INTEGER DEFAULT 0')
 
             conn.commit()
 
@@ -797,6 +802,61 @@ class Database:
             conn.commit()
 
         return sessions
+
+    def get_upcoming_sessions_24h(self) -> List[dict]:
+        """
+        Найти сессии, которые начнутся примерно через 24 часа (±3 минуты).
+        Уведомление клиенту отправляется только один раз (notified_24h = 0).
+        """
+        now = datetime.now(TIMEZONE)
+        minutes_before = 24 * 60  # 1440 минут
+        window_start = now + timedelta(minutes=minutes_before - 3)
+        window_end   = now + timedelta(minutes=minutes_before + 3)
+
+        target_date = (now + timedelta(minutes=minutes_before)).strftime("%Y-%m-%d")
+        ws_hm = window_start.strftime("%H:%M")
+        we_hm = window_end.strftime("%H:%M")
+
+        with self.get_connection() as conn:
+            rows = conn.execute('''
+                SELECT b.id, b.user_id, u.first_name, u.username,
+                       ts.day, ts.adjusted_time, ts.date
+                FROM bookings b
+                JOIN users u       ON b.user_id  = u.user_id
+                JOIN time_slots ts ON b.slot_id  = ts.id
+                WHERE b.status         = 'active'
+                  AND ts.date          = ?
+                  AND ts.adjusted_time >= ?
+                  AND ts.adjusted_time <= ?
+                  AND b.notified_24h   = 0
+            ''', (target_date, ws_hm, we_hm)).fetchall()
+
+            sessions = [
+                {
+                    'booking_id': r[0], 'user_id': r[1], 'name': r[2],
+                    'username': r[3], 'day': r[4], 'time': r[5], 'date': r[6]
+                }
+                for r in rows
+            ]
+
+            # Помечаем как уведомлённые сразу (защита от дублей)
+            for s in sessions:
+                conn.execute(
+                    'UPDATE bookings SET notified_24h = 1 WHERE id = ?',
+                    (s['booking_id'],)
+                )
+            conn.commit()
+
+        return sessions
+
+    def reset_24h_notification_for_booking(self, booking_id: int) -> bool:
+        """Сбросить 24ч-флаг для повторной попытки при сбое отправки."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                'UPDATE bookings SET notified_24h = 0 WHERE id = ?', (booking_id,)
+            )
+            conn.commit()
+            return cur.rowcount > 0
 
     def mark_notification_sent(self, booking_id: int) -> bool:
         with self.get_connection() as conn:

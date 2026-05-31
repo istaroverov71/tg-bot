@@ -243,7 +243,7 @@ async def cancel_booking_start(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"❌ Отмена невозможна.\n\n"
                     f"Запись на {booking['day']} в {booking['time']} нельзя отменить "
                     f"менее чем за 3 часа до начала.\n\n"
-                    f"Для отмены свяжитесь напрямую.",
+                    f"Для отмены свяжитесь напрямую: @n_kshmlv",
                     reply_markup=Keyboards.get_main_keyboard(),
                 )
                 return
@@ -501,7 +501,7 @@ async def process_cancellation(query, context, booking_id: int):
                     f"❌ Отмена невозможна.\n\n"
                     f"Запись на {booking_info['day']} в {booking_info['adjusted_time']} нельзя отменить "
                     f"менее чем за 3 часа до начала.\n\n"
-                    f"Для отмены свяжитесь напрямую."
+                    f"Для отмены свяжитесь напрямую: @n_kshmlv"
                 )
                 return
 

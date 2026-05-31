@@ -332,8 +332,9 @@ class Database:
         with self.get_connection() as conn:
             for t in times:
                 row = conn.execute(
-                    'SELECT id, is_available FROM time_slots WHERE date = ? AND base_time = ?',
-                    (date_str, t),
+                    '''SELECT id, is_available FROM time_slots
+                       WHERE date = ? AND (base_time = ? OR adjusted_time = ?)''',
+                    (date_str, t, t),
                 ).fetchone()
 
                 if not row:

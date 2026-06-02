@@ -750,27 +750,18 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     for session in upcoming:
         slot_str = f"{session['day']} в {session['time']}"
 
-        # Баг 3: сначала отправляем, потом проверяем результат.
-        # get_upcoming_sessions предварительно помечает notified_15min=1 (защита от дублей).
-        # Если отправка не удалась — сбрасываем флаг, чтобы повторить при следующей проверке.
-        user_sent = False
         try:
             await context.bot.send_message(
                 session['user_id'],
                 REMINDER_USER.format(slot=slot_str),
             )
-            user_sent = True
             logger.info(f"Reminder sent to user {session['user_id']}")
         except Forbidden:
-            # Пользователь заблокировал бота — деактивируем, не пробуем снова
             db.deactivate_user(session['user_id'])
             logger.warning(f"User {session['user_id']} blocked the bot — deactivated")
         except Exception as e:
             logger.error(f"Failed to send reminder to user {session['user_id']}: {e}")
             db.reset_notification_for_booking(session['booking_id'])
-
-        if not user_sent:
-            continue  # не беспокоим админа, если пользователь не получил уведомление
 
         for admin_id in ADMIN_IDS:
             try:

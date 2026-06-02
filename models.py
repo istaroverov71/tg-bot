@@ -17,9 +17,9 @@ class TimeSlot:
     week_start: str  # Начало недели для группировки
     
     def get_datetime(self) -> datetime:
-        """Получить datetime объекта"""
+        """Получить datetime объекта (московское время через localize — без LMT-бага pytz)"""
         dt_str = f"{self.date} {self.adjusted_time}"
-        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=TIMEZONE)
+        return TIMEZONE.localize(datetime.strptime(dt_str, "%Y-%m-%d %H:%M"))
     
     def is_today(self) -> bool:
         """Проверка, является ли слот сегодняшним"""

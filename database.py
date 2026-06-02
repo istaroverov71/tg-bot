@@ -22,9 +22,13 @@ class Database:
         self.init_db()
 
     def get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(DATABASE_FILE)
-        # Включаем внешние ключи
+        # timeout=30: ждём освобождения блокировки до 30с (а не падаем сразу),
+        # busy_timeout дублирует это на уровне SQLite. WAL разрешает читать во время
+        # записи — вместе с BEGIN IMMEDIATE снижает риск "database is locked" (H1).
+        conn = sqlite3.connect(DATABASE_FILE, timeout=30)
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def init_db(self):
@@ -417,79 +421,104 @@ class Database:
         """
         Забронировать слот через SmartScheduler.
 
-        ИСПРАВЛЕНО: убраны вложенные BEGIN/COMMIT/ROLLBACK.
-        sqlite3 с `with conn` сам откатывает при исключении.
+        Конкурентность (C2): весь цикл «прочитать снимок недели → пересчитать
+        планировщиком → записать» выполняется в ОДНОЙ транзакции BEGIN IMMEDIATE.
+        Захват write-lock сериализует параллельные брони, что исключает:
+          • lost update (затирание чужой записи устаревшим снимком),
+          • двойную бронь одного слота.
+
+        Календарная неделя (M1): обычный пользователь не может иметь больше одной
+        НЕотменённой записи (active/completed) в пределах одной календарной недели
+        (пн–вс) — даже если его сессия на этой неделе уже прошла. Записаться снова
+        он сможет только на слоты следующей недели. Для администратора лимита нет.
 
         Возвращает: (success, booked_time_or_error, slot_info_dict)
         """
-        all_slots = self.get_all_slots_for_scheduling(week_start)
-        if not all_slots:
-            return False, "Нет слотов на эту неделю", None
-
-        scheduler = SmartScheduler(all_slots)
-        success, booked_time, changes = scheduler.book_slot(slot_id, user_id, is_admin=is_admin)
-
-        if not success:
-            return False, booked_time, None
-
-        booked_slot = scheduler.find_slot_by_id(slot_id)
-
+        conn = self.get_connection()
         try:
-            with self.get_connection() as conn:
-                # Баг 1: атомарно захватываем целевой слот.
-                # WHERE ... AND is_available=1 защищает от гонки двух пользователей:
-                # если между нашим чтением и записью другой юзер уже занял слот,
-                # rowcount = 0 — мы выходим без создания дублирующей записи.
-                cursor = conn.execute('''
+            conn.isolation_level = None         # управляем транзакцией вручную
+            conn.execute("BEGIN IMMEDIATE")     # write-lock: сериализует конкурентные брони
+
+            # Свежий снимок слотов недели — ВНУТРИ транзакции (фикс гонки C2)
+            rows = conn.execute('''
+                SELECT id, base_time, adjusted_time, day, date, week_start,
+                       CASE WHEN is_available = 0 THEN 1 ELSE 0 END AS is_booked,
+                       booked_by
+                FROM time_slots
+                WHERE week_start = ?
+                ORDER BY date, base_time
+            ''', (week_start,)).fetchall()
+
+            if not rows:
+                conn.execute("ROLLBACK")
+                return False, "Нет слотов на эту неделю", None
+
+            all_slots = [
+                Slot(id=r[0], base_time=r[1], current_time=r[2],
+                     day=r[3], date=r[4], week_start=r[5],
+                     is_booked=bool(r[6]), booked_by=r[7])
+                for r in rows
+            ]
+
+            # M1: одна запись в календарную неделю (пн–вс) для обычного пользователя.
+            # Считаем все НЕотменённые записи (active + completed) → прошедшая сессия
+            # тоже занимает неделю.
+            if not is_admin:
+                ws_dt = datetime.strptime(week_start, "%Y-%m-%d")
+                week_sunday = (ws_dt + timedelta(days=6)).strftime("%Y-%m-%d")
+                already = conn.execute('''
+                    SELECT COUNT(*) FROM bookings b
+                    JOIN time_slots ts ON b.slot_id = ts.id
+                    WHERE b.user_id = ?
+                      AND b.status != 'cancelled'
+                      AND ts.date >= ?
+                      AND ts.date <= ?
+                ''', (user_id, week_start, week_sunday)).fetchone()[0]
+                if already > 0:
+                    conn.execute("ROLLBACK")
+                    return False, (
+                        "⚠️ У вас уже есть запись на этой неделе.\n\n"
+                        "На одной неделе можно записаться только один раз. "
+                        "Записаться снова можно будет на слоты следующей недели."
+                    ), None
+
+            scheduler = SmartScheduler(all_slots)
+            success, booked_time, changes = scheduler.book_slot(slot_id, user_id, is_admin=is_admin)
+            if not success:
+                conn.execute("ROLLBACK")
+                return False, booked_time, None
+
+            booked_slot = scheduler.find_slot_by_id(slot_id)
+
+            # Записываем рассчитанные позиции всех слотов недели
+            for slot in scheduler.slots:
+                conn.execute('''
                     UPDATE time_slots
-                    SET adjusted_time = ?,
-                        is_available  = 0,
-                        booked_by     = ?
-                    WHERE id = ? AND is_available = 1
-                ''', (booked_slot.current_time, user_id, slot_id))
-
-                if cursor.rowcount == 0:
-                    # Слот занят другим пользователем прямо между нашим чтением и записью
-                    return False, "К сожалению, этот слот только что заняли. Выберите другое время.", None
-
-                # Обновляем adjusted_time остальных слотов (сдвиги от SmartScheduler)
-                for slot in scheduler.slots:
-                    if slot.id == slot_id:
-                        continue  # целевой слот уже обновлён выше
-                    conn.execute('''
-                        UPDATE time_slots
-                        SET adjusted_time = ?,
-                            is_available  = ?,
-                            booked_by     = ?
-                        WHERE id = ?
-                    ''', (
-                        slot.current_time,
-                        0 if slot.is_booked else 1,
-                        slot.booked_by,
-                        slot.id
-                    ))
-
-                # Создаём запись о бронировании
-                cursor = conn.execute('''
-                    INSERT INTO bookings
-                    (user_id, slot_id, original_time, adjusted_time, booking_date, status)
-                    VALUES (?, ?, ?, ?, ?, 'active')
+                    SET adjusted_time = ?, is_available = ?, booked_by = ?
+                    WHERE id = ?
                 ''', (
-                    user_id,
-                    slot_id,
-                    booked_slot.base_time,
-                    booked_time,
-                    datetime.now(TIMEZONE).isoformat()
+                    slot.current_time,
+                    0 if slot.is_booked else 1,
+                    slot.booked_by,
+                    slot.id
                 ))
-                booking_id = cursor.lastrowid
 
-                # Привязываем booking_id к слоту
-                conn.execute(
-                    'UPDATE time_slots SET booking_id = ? WHERE id = ?',
-                    (booking_id, slot_id)
-                )
+            # Создаём запись о бронировании
+            cursor = conn.execute('''
+                INSERT INTO bookings
+                (user_id, slot_id, original_time, adjusted_time, booking_date, status)
+                VALUES (?, ?, ?, ?, ?, 'active')
+            ''', (
+                user_id, slot_id, booked_slot.base_time, booked_time,
+                datetime.now(TIMEZONE).isoformat()
+            ))
+            booking_id = cursor.lastrowid
+            conn.execute(
+                'UPDATE time_slots SET booking_id = ? WHERE id = ?',
+                (booking_id, slot_id)
+            )
 
-                conn.commit()
+            conn.execute("COMMIT")
 
             slot_info = {
                 'day': booked_slot.day,
@@ -500,55 +529,96 @@ class Database:
             return True, booked_time, slot_info
 
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             import logging
             logging.getLogger(__name__).error(f"book_slot_with_scheduler error: {e}")
             return False, f"Ошибка базы данных: {e}", None
+        finally:
+            conn.close()
 
     def cancel_booking_with_scheduler(self, user_id: int, booking_id: int) -> bool:
         """
         Отменить запись и пересчитать расписание.
 
-        ИСПРАВЛЕНО: убраны вложенные BEGIN/COMMIT/ROLLBACK.
+        Конкурентность (C2): чтение снимка недели, пересчёт и запись выполняются
+        в одной транзакции BEGIN IMMEDIATE — как и при бронировании.
         """
-        booking = self.get_booking_by_id(booking_id)
-        if not booking or booking['user_id'] != user_id:
+        if booking_id is None:
             return False
 
-        week_start = booking['week_start']
-        all_slots = self.get_all_slots_for_scheduling(week_start)
-        scheduler = SmartScheduler(all_slots)
-
-        success, changes = scheduler.cancel_booking(booking['slot_id'])
-        if not success:
-            return False
-
+        conn = self.get_connection()
         try:
-            with self.get_connection() as conn:
-                for slot in scheduler.slots:
-                    conn.execute('''
-                        UPDATE time_slots
-                        SET adjusted_time = ?,
-                            is_available  = ?,
-                            booked_by     = ?
-                        WHERE id = ?
-                    ''', (
-                        slot.current_time,
-                        0 if slot.is_booked else 1,
-                        slot.booked_by,
-                        slot.id
-                    ))
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE")
 
-                conn.execute(
-                    "UPDATE bookings SET status = 'cancelled' WHERE id = ?",
-                    (booking_id,)
-                )
-                conn.commit()
+            # Проверяем владельца и получаем слот/неделю внутри транзакции
+            brow = conn.execute('''
+                SELECT b.slot_id, b.user_id, ts.week_start
+                FROM bookings b
+                JOIN time_slots ts ON b.slot_id = ts.id
+                WHERE b.id = ?
+            ''', (booking_id,)).fetchone()
+
+            if not brow or brow[1] != user_id:
+                conn.execute("ROLLBACK")
+                return False
+
+            slot_id, _owner, week_start = brow
+
+            rows = conn.execute('''
+                SELECT id, base_time, adjusted_time, day, date, week_start,
+                       CASE WHEN is_available = 0 THEN 1 ELSE 0 END AS is_booked,
+                       booked_by
+                FROM time_slots
+                WHERE week_start = ?
+                ORDER BY date, base_time
+            ''', (week_start,)).fetchall()
+
+            all_slots = [
+                Slot(id=r[0], base_time=r[1], current_time=r[2],
+                     day=r[3], date=r[4], week_start=r[5],
+                     is_booked=bool(r[6]), booked_by=r[7])
+                for r in rows
+            ]
+
+            scheduler = SmartScheduler(all_slots)
+            success, changes = scheduler.cancel_booking(slot_id)
+            if not success:
+                conn.execute("ROLLBACK")
+                return False
+
+            for slot in scheduler.slots:
+                conn.execute('''
+                    UPDATE time_slots
+                    SET adjusted_time = ?, is_available = ?, booked_by = ?
+                    WHERE id = ?
+                ''', (
+                    slot.current_time,
+                    0 if slot.is_booked else 1,
+                    slot.booked_by,
+                    slot.id
+                ))
+
+            conn.execute(
+                "UPDATE bookings SET status = 'cancelled' WHERE id = ?",
+                (booking_id,)
+            )
+            conn.execute("COMMIT")
             return True
 
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             import logging
             logging.getLogger(__name__).error(f"cancel_booking_with_scheduler error: {e}")
             return False
+        finally:
+            conn.close()
 
     # ============================
     # БРОНИРОВАНИЯ
@@ -581,6 +651,38 @@ class Database:
                 LIMIT 1
             ''', (user_id, now_str)).fetchone()
 
+        if row:
+            return {
+                'booking_id': row[0], 'day': row[1], 'time': row[2],
+                'date': row[3], 'base_time': row[4], 'week_start': row[5]
+            }
+        return None
+
+    def get_user_booking_in_week(self, user_id: int, week_monday_str: str,
+                                 week_sunday_str: str) -> Optional[dict]:
+        """
+        Запись пользователя в пределах календарной недели [пн, вс].
+
+        Учитывает все НЕотменённые записи (status != 'cancelled'), т.е. и активные,
+        и уже прошедшие (completed). Нужна для правила «одна запись в календарную
+        неделю» (M1): если клиент уже был на сессии этой недели — он считается
+        занятым на эту неделю и может записаться только на следующую.
+
+        Возвращает данные ближайшей такой записи или None.
+        """
+        with self.get_connection() as conn:
+            row = conn.execute('''
+                SELECT b.id, ts.day, ts.adjusted_time, ts.date,
+                       ts.base_time, ts.week_start
+                FROM bookings b
+                JOIN time_slots ts ON b.slot_id = ts.id
+                WHERE b.user_id = ?
+                  AND b.status != 'cancelled'
+                  AND ts.date >= ?
+                  AND ts.date <= ?
+                ORDER BY ts.date, ts.base_time
+                LIMIT 1
+            ''', (user_id, week_monday_str, week_sunday_str)).fetchone()
         if row:
             return {
                 'booking_id': row[0], 'day': row[1], 'time': row[2],
@@ -754,36 +856,43 @@ class Database:
     # НАПОМИНАНИЯ
     # ============================
 
-    def get_upcoming_sessions(self, minutes_before: int = 15) -> List[dict]:
+    def _get_due_sessions(self, minutes_before: int, grace_minutes: int,
+                          flag_column: str) -> List[dict]:
         """
-        Найти сессии, которые начнутся примерно через minutes_before минут
-        (±3 минуты — защита от пропуска при проверке каждые 5 мин).
-        Время рассчитывается по московскому часовому поясу.
-        Уведомление отправляется только один раз (notified_15min = 0).
-        """
-        now = datetime.now(TIMEZONE)
-        # Окно поиска: от (minutes_before - 3) до (minutes_before + 3) минут
-        window_start = now + timedelta(minutes=minutes_before - 3)
-        window_end   = now + timedelta(minutes=minutes_before + 3)
+        Найти сессии, до начала которых осталось <= minutes_before минут,
+        но > (minutes_before - grace_minutes) минут.
 
-        # Для поиска по дате используем дату целевого времени
-        target_date = (now + timedelta(minutes=minutes_before)).strftime("%Y-%m-%d")
-        ws_hm = window_start.strftime("%H:%M")
-        we_hm = window_end.strftime("%H:%M")
+        Ключевое свойство: напоминание НИКОГДА не отправляется раньше, чем
+        за minutes_before минут до сессии (нет «за 18 минут» / «за 24ч 3мин»).
+        grace_minutes — окно «подхвата»: на случай сбоя отправки (флаг сбрасывается
+        и попытка повторяется) или кратковременного простоя бота.
+
+        Сравнение идёт по полному datetime (date + time), поэтому окно корректно
+        работает и при переходе через полночь. Время — московское.
+        Найденные записи сразу помечаются flag_column=1 (защита от дублей).
+        """
+        # Защита: имя колонки подставляется в SQL, поэтому жёстко валидируем.
+        if flag_column not in ('notified_15min', 'notified_24h'):
+            raise ValueError(f"Недопустимая колонка флага: {flag_column}")
+
+        now = datetime.now(TIMEZONE)
+        upper = now + timedelta(minutes=minutes_before)                    # остаток <= minutes_before
+        lower = now + timedelta(minutes=minutes_before - grace_minutes)    # остаток >  (minutes_before - grace)
+        upper_str = upper.strftime("%Y-%m-%d %H:%M")
+        lower_str = lower.strftime("%Y-%m-%d %H:%M")
 
         with self.get_connection() as conn:
-            rows = conn.execute('''
+            rows = conn.execute(f'''
                 SELECT b.id, b.user_id, u.first_name, u.username,
                        ts.day, ts.adjusted_time, ts.date
                 FROM bookings b
-                JOIN users u  ON b.user_id  = u.user_id
-                JOIN time_slots ts ON b.slot_id = ts.id
+                JOIN users u       ON b.user_id  = u.user_id
+                JOIN time_slots ts ON b.slot_id  = ts.id
                 WHERE b.status = 'active'
-                  AND ts.date          = ?
-                  AND ts.adjusted_time >= ?
-                  AND ts.adjusted_time <= ?
-                  AND b.notified_15min = 0
-            ''', (target_date, ws_hm, we_hm)).fetchall()
+                  AND (ts.date || ' ' || ts.adjusted_time) >  ?
+                  AND (ts.date || ' ' || ts.adjusted_time) <= ?
+                  AND b.{flag_column} = 0
+            ''', (lower_str, upper_str)).fetchall()
 
             sessions = [
                 {
@@ -796,58 +905,36 @@ class Database:
             # Помечаем как уведомлённые сразу, чтобы не отправить дважды
             for s in sessions:
                 conn.execute(
-                    'UPDATE bookings SET notified_15min = 1 WHERE id = ?',
+                    f'UPDATE bookings SET {flag_column} = 1 WHERE id = ?',
                     (s['booking_id'],)
                 )
             conn.commit()
 
         return sessions
+
+    def get_upcoming_sessions(self, minutes_before: int = 15) -> List[dict]:
+        """
+        Сессии, до которых осталось не более minutes_before минут (по умолчанию 15)
+        и которые ещё не начались. Напоминание не уходит раньше чем за 15 минут.
+        Окно подхвата = minutes_before (нижняя граница = «сейчас»): если отправка
+        сорвалась, повтор произойдёт на следующей проверке.
+        Уведомление отправляется один раз (notified_15min).
+        """
+        return self._get_due_sessions(
+            minutes_before, grace_minutes=minutes_before, flag_column='notified_15min'
+        )
 
     def get_upcoming_sessions_24h(self) -> List[dict]:
         """
-        Найти сессии, которые начнутся примерно через 24 часа (±3 минуты).
-        Уведомление клиенту отправляется только один раз (notified_24h = 0).
+        Сессии, до которых осталось не более 24 часов (и не начались).
+        Напоминание не уходит раньше чем за 24 часа. Окно подхвата — 30 минут:
+        ловит сессию у отметки 24ч и не срабатывает для записей, сделанных
+        менее чем за ~23.5 часа (для них напоминание за 24ч бессмысленно).
+        Уведомление отправляется один раз (notified_24h).
         """
-        now = datetime.now(TIMEZONE)
-        minutes_before = 24 * 60  # 1440 минут
-        window_start = now + timedelta(minutes=minutes_before - 3)
-        window_end   = now + timedelta(minutes=minutes_before + 3)
-
-        target_date = (now + timedelta(minutes=minutes_before)).strftime("%Y-%m-%d")
-        ws_hm = window_start.strftime("%H:%M")
-        we_hm = window_end.strftime("%H:%M")
-
-        with self.get_connection() as conn:
-            rows = conn.execute('''
-                SELECT b.id, b.user_id, u.first_name, u.username,
-                       ts.day, ts.adjusted_time, ts.date
-                FROM bookings b
-                JOIN users u       ON b.user_id  = u.user_id
-                JOIN time_slots ts ON b.slot_id  = ts.id
-                WHERE b.status         = 'active'
-                  AND ts.date          = ?
-                  AND ts.adjusted_time >= ?
-                  AND ts.adjusted_time <= ?
-                  AND b.notified_24h   = 0
-            ''', (target_date, ws_hm, we_hm)).fetchall()
-
-            sessions = [
-                {
-                    'booking_id': r[0], 'user_id': r[1], 'name': r[2],
-                    'username': r[3], 'day': r[4], 'time': r[5], 'date': r[6]
-                }
-                for r in rows
-            ]
-
-            # Помечаем как уведомлённые сразу (защита от дублей)
-            for s in sessions:
-                conn.execute(
-                    'UPDATE bookings SET notified_24h = 1 WHERE id = ?',
-                    (s['booking_id'],)
-                )
-            conn.commit()
-
-        return sessions
+        return self._get_due_sessions(
+            24 * 60, grace_minutes=30, flag_column='notified_24h'
+        )
 
     def reset_24h_notification_for_booking(self, booking_id: int) -> bool:
         """Сбросить 24ч-флаг для повторной попытки при сбое отправки."""

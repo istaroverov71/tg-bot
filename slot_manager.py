@@ -116,8 +116,9 @@ class SlotManager:
             if slot_date == today:
                 # Не показываем сегодняшние слоты, которые уже прошли
                 # или наступят менее чем через 2 часа
-                slot_time = datetime.strptime(f"{slot.date} {slot.adjusted_time}", "%Y-%m-%d %H:%M")
-                slot_time = slot_time.replace(tzinfo=TIMEZONE)
+                slot_time = TIMEZONE.localize(
+                    datetime.strptime(f"{slot.date} {slot.adjusted_time}", "%Y-%m-%d %H:%M")
+                )
                 
                 # Даем минимум 3 часа на подготовку (баг 11: было 2 часа — несоответствие с bot.py)
                 if slot_time <= now + timedelta(hours=3):

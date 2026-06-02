@@ -12,11 +12,12 @@
 #   4. show_booking_days теперь корректно работает при вызове из callback
 #      (query вместо update).
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Forbidden
+from telegram.error import Forbidden, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -45,6 +46,18 @@ _DAY_ABBR = {
     "Четверг": "Чт ", "Пятница": "Пт ", "Суббота": "Сб ", "Воскресенье": "Вск ",
 }
 
+def _esc_md(text) -> str:
+    """Экранировать спецсимволы legacy-Markdown в пользовательском тексте.
+    Без этого имя/username клиента с символами _ * ` [ ломает parse_mode='Markdown'
+    (Telegram возвращает BadRequest: can't parse entities)."""
+    if text is None:
+        return ""
+    text = str(text)
+    for ch in ('\\', '_', '*', '`', '['):
+        text = text.replace(ch, '\\' + ch)
+    return text
+
+
 def _day_label(day_name: str, date_str: str) -> str:
     """Формирует метку вида 'Ср (11.03)' — единый формат по всему боту."""
     abbr = _DAY_ABBR.get(day_name, day_name[:2])
@@ -66,6 +79,27 @@ db = Database()
 slot_manager = SlotManager(db)
 
 
+async def _send_with_retry(bot, chat_id, text, **kwargs) -> bool:
+    """
+    Отправка сообщения с обработкой флуд-лимита Telegram (RetryAfter) — H4.
+    При 429 ждём указанное API время и пробуем ещё раз.
+    Возвращает True при успехе, False если доставить не удалось.
+    Forbidden НЕ перехватывается здесь — он нужен вызывающему коду для деактивации
+    пользователя (заблокировал бота).
+    """
+    for _attempt in range(3):
+        try:
+            await bot.send_message(chat_id, text, **kwargs)
+            return True
+        except RetryAfter as e:
+            ra = getattr(e, 'retry_after', 1)
+            # PTB ≥22 в будущем сделает retry_after timedelta — поддержим оба варианта
+            if hasattr(ra, 'total_seconds'):
+                ra = ra.total_seconds()
+            await asyncio.sleep(float(ra) + 0.5)
+    return False
+
+
 # ========== ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -85,19 +119,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     is_admin = user.id in ADMIN_IDS
+    # H2: экранируем пользовательские поля, иначе имя/username с символами Markdown
+    # (_ * ` [) ломают сообщение.
     message = (
         f"👤 **Ваша информация:**\n"
         f"• ID: `{user.id}`\n"
-        f"• Имя: {user.first_name}\n"
-        f"• Username: @{user.username or 'не указан'}\n"
-        f"• Админ: {'✅ ДА' if is_admin else '❌ НЕТ'}\n\n"
-        f"**Текущие админы в config.py:**\n"
+        f"• Имя: {_esc_md(user.first_name)}\n"
+        f"• Username: @{_esc_md(user.username) or 'не указан'}\n"
+        f"• Админ: {'✅ ДА' if is_admin else '❌ НЕТ'}\n"
     )
-    for admin_id in (ADMIN_IDS or []):
-        message += f"• `{admin_id}`\n"
-    if not ADMIN_IDS:
-        message += "• Список пуст\n"
-    message += "\nЧтобы стать админом, добавьте свой ID в `ADMIN_IDS` в config.py"
+    # H5: список админских ID показываем только самим админам — не раскрываем посторонним.
+    if is_admin:
+        message += "\n**Текущие админы в config.py:**\n"
+        for admin_id in (ADMIN_IDS or []):
+            message += f"• `{admin_id}`\n"
+        if not ADMIN_IDS:
+            message += "• Список пуст\n"
     await update.message.reply_text(message, parse_mode='Markdown')
 
 
@@ -139,16 +176,6 @@ async def show_booking_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     is_admin = user_id in ADMIN_IDS
 
-    # Обычный пользователь: только одна запись в неделю
-    if not is_admin:
-        existing = db.get_user_active_booking(user_id)
-        if existing:
-            await reply(
-                ALREADY_BOOKED.format(slot=f"{_day_label(existing['day'], existing['date'])} в {existing['time']}"),
-                reply_markup=Keyboards.get_main_keyboard(),
-            )
-            return
-
     # Ищем ближайшие доступные слоты, проверяя текущую и следующие 2 недели.
     #
     # Старая логика смотрела на следующую неделю ТОЛЬКО если в БД вообще нет строк
@@ -159,12 +186,18 @@ async def show_booking_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #
     # Исправление: перебираем недели до тех пор, пока не найдём хотя бы один
     # видимый (будущий) слот.
+    #
+    # M1: одна запись в КАЛЕНДАРНУЮ неделю. Если у пользователя уже есть запись
+    # на рассматриваемой неделе (в т.ч. уже прошедшая сессия) — пропускаем эту
+    # неделю и предлагаем следующую. Так клиент, побывавший на сессии, сможет
+    # записаться только на слоты следующей недели.
     now_tz = datetime.now(TIMEZONE)
     cutoff = now_tz + timedelta(hours=3)
 
     week_start = slot_manager.current_week_start
     all_slots: list = []
     visible_slots: list = []
+    already_booked = None  # запись пользователя в пропущенной из-за лимита неделе
 
     for weeks_ahead in range(3):  # текущая неделя + 2 следующие
         candidate_week = (
@@ -174,12 +207,22 @@ async def show_booking_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not candidate_slots:
             continue
 
+        if not is_admin:
+            week_sunday = (
+                datetime.strptime(candidate_week, "%Y-%m-%d") + timedelta(days=6)
+            ).strftime("%Y-%m-%d")
+            existing = db.get_user_booking_in_week(user_id, candidate_week, week_sunday)
+            if existing:
+                already_booked = already_booked or existing
+                continue  # на этой неделе запись уже есть — пробуем следующую
+
         smart_candidate = SmartScheduler(candidate_slots)
         candidate_visible = smart_candidate.get_visible_slots()
         candidate_visible = [
             s for s in candidate_visible
-            if datetime.strptime(f"{s.date} {s.current_time}", "%Y-%m-%d %H:%M")
-                   .replace(tzinfo=TIMEZONE) >= cutoff
+            if TIMEZONE.localize(
+                   datetime.strptime(f"{s.date} {s.current_time}", "%Y-%m-%d %H:%M")
+               ) >= cutoff
         ]
         if candidate_visible:
             all_slots = candidate_slots
@@ -187,7 +230,16 @@ async def show_booking_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break  # нашли неделю с будущими слотами — дальше не ищем
 
     if not visible_slots:
-        await reply(NO_SLOTS_MESSAGE, reply_markup=Keyboards.get_main_keyboard())
+        if already_booked:
+            await reply(
+                ALREADY_BOOKED.format(
+                    slot=f"{_day_label(already_booked['day'], already_booked['date'])} "
+                         f"в {already_booked['time']}"
+                ),
+                reply_markup=Keyboards.get_main_keyboard(),
+            )
+        else:
+            await reply(NO_SLOTS_MESSAGE, reply_markup=Keyboards.get_main_keyboard())
         return
 
     # Строим метки вида "ПТ 13.03" — берём дату из первого слота каждого дня
@@ -236,9 +288,9 @@ async def cancel_booking_start(update: Update, context: ContextTypes.DEFAULT_TYP
     if booking:
         # Пункт 5: запрет отмены менее чем за 3 часа (кроме админа)
         if user_id not in ADMIN_IDS:
-            session_dt = datetime.strptime(
+            session_dt = TIMEZONE.localize(datetime.strptime(
                 f"{booking['date']} {booking['time']}", "%Y-%m-%d %H:%M"
-            ).replace(tzinfo=TIMEZONE)
+            ))
             if session_dt - datetime.now(TIMEZONE) < timedelta(hours=3):
                 await update.message.reply_text(
                     f"❌ Отмена невозможна.\n\n"
@@ -402,23 +454,30 @@ async def process_final_booking(query, context, slot_id: int):
     user_id = query.from_user.id
     is_admin = user_id in ADMIN_IDS
 
-    # Обычный пользователь — проверяем ограничение одна запись в неделю
+    # Берём week_start из самого слота — он может быть на следующей неделе.
+    # Если контекст потерян (рестарт бота) — подтягиваем неделю слота из БД.
+    all_slots = context.user_data.get('all_slots', [])
+    target_slot = next((s for s in all_slots if s.id == slot_id), None)
+    if target_slot:
+        week_start = target_slot.week_start
+    else:
+        slot_db = db.get_slot_by_id(slot_id)
+        week_start = slot_db.week_start if slot_db else slot_manager.current_week_start
+
+    # M1: одна запись в КАЛЕНДАРНУЮ неделю слота (учитываются и прошедшие сессии).
+    # Это «дружелюбная» проверка ради красивого сообщения; финальную гарантию
+    # даёт сама book_slot_with_scheduler внутри транзакции.
     if not is_admin:
-        existing = db.get_user_active_booking(user_id)
+        week_sunday = (
+            datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=6)
+        ).strftime("%Y-%m-%d")
+        existing = db.get_user_booking_in_week(user_id, week_start, week_sunday)
         if existing:
             dl = _day_label(existing['day'], existing['date'])
             await query.edit_message_text(
                 ALREADY_BOOKED.format(slot=f"{dl} в {existing['time']}")
             )
             return
-
-    # Берём week_start из самого слота — он может быть на следующей неделе
-    all_slots = context.user_data.get('all_slots', [])
-    target_slot = next((s for s in all_slots if s.id == slot_id), None)
-    if target_slot:
-        week_start = target_slot.week_start
-    else:
-        week_start = slot_manager.current_week_start
 
     success, message, slot_info = db.book_slot_with_scheduler(user_id, slot_id, week_start, is_admin=is_admin)
 
@@ -473,9 +532,9 @@ async def process_cancellation(query, context, booking_id: int):
     if user_id not in ADMIN_IDS:
         booking_info = db.get_booking_by_id(booking_id)
         if booking_info:
-            session_dt = datetime.strptime(
+            session_dt = TIMEZONE.localize(datetime.strptime(
                 f"{booking_info['date']} {booking_info['adjusted_time']}", "%Y-%m-%d %H:%M"
-            ).replace(tzinfo=TIMEZONE)
+            ))
             if session_dt - datetime.now(TIMEZONE) < timedelta(hours=3):
                 await query.edit_message_text(
                     f"❌ Отмена невозможна.\n\n"
@@ -531,9 +590,9 @@ async def pre_cancel_confirm(query, booking_id: int):
         return
 
     if user_id not in ADMIN_IDS:
-        session_dt = datetime.strptime(
+        session_dt = TIMEZONE.localize(datetime.strptime(
             f"{booking_info['date']} {booking_info['adjusted_time']}", "%Y-%m-%d %H:%M"
-        ).replace(tzinfo=TIMEZONE)
+        ))
         if session_dt - datetime.now(TIMEZONE) < timedelta(hours=3):
             await query.edit_message_text(
                 f"❌ Отмена невозможна.\n\n"
@@ -565,9 +624,9 @@ async def process_change_booking(query, context):
 
     # Проверяем 3-часовое правило (кроме администратора)
     if user_id not in ADMIN_IDS:
-        session_dt = datetime.strptime(
+        session_dt = TIMEZONE.localize(datetime.strptime(
             f"{booking['date']} {booking['time']}", "%Y-%m-%d %H:%M"
-        ).replace(tzinfo=TIMEZONE)
+        ))
         if session_dt - datetime.now(TIMEZONE) < timedelta(hours=3):
             await query.edit_message_text(
                 f"❌ Изменить запись невозможно.\n\n"
@@ -604,9 +663,9 @@ async def execute_change_booking(query, context, booking_id: int):
     # Баг 1: повторная проверка 3ч — пользователь мог подтвердить кнопку
     # спустя долгое время после того, как process_change_booking показал диалог.
     if user_id not in ADMIN_IDS:
-        session_dt = datetime.strptime(
+        session_dt = TIMEZONE.localize(datetime.strptime(
             f"{booking['date']} {booking['time']}", "%Y-%m-%d %H:%M"
-        ).replace(tzinfo=TIMEZONE)
+        ))
         if session_dt - datetime.now(TIMEZONE) < timedelta(hours=3):
             await query.edit_message_text(
                 f"❌ Изменить запись больше нельзя.\n\n"
@@ -664,7 +723,7 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     Отправить напоминания:
       — за 24 часа: клиенту (текст об оплате и правиле отмены)
       — за 15 минут: клиенту + администратору
-    Вызывается через job_queue PTB каждые 5 минут.
+    Вызывается через job_queue PTB каждую минуту (окно в БД гарантирует «не раньше»).
     """
     logger.info("Checking reminders...")
 
@@ -910,9 +969,11 @@ async def admin_update_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         failed_details = []
         for u in users_to_notify:
             try:
-                await context.bot.send_message(u["user_id"], notif_text)
-                sent += 1
-                logger.info(f"✅ Уведомление отправлено {u['user_id']} ({u['first_name']})")
+                if await _send_with_retry(context.bot, u["user_id"], notif_text):
+                    sent += 1
+                    logger.info(f"✅ Уведомление отправлено {u['user_id']} ({u['first_name']})")
+                else:
+                    failed_details.append(f"{u['first_name']} (id={u['user_id']}): флуд-лимит, не доставлено")
             except Forbidden:
                 blocked += 1
                 db.deactivate_user(u["user_id"])
@@ -920,6 +981,8 @@ async def admin_update_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 failed_details.append(f"{u['first_name']} (id={u['user_id']}): {e}")
                 logger.warning(f"Не удалось уведомить {u['user_id']}: {e}")
+            # H4: троттлинг ~20 сообщений/с — держимся ниже флуд-лимита Telegram
+            await asyncio.sleep(0.05)
         result_msg = f"📣 Уведомлено {sent} из {len(users_to_notify)} пользователей."
         if blocked:
             result_msg += f"\n🚫 Заблокировали бота: {blocked} (деактивированы)"
@@ -964,8 +1027,9 @@ async def admin_view_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Фильтр: только слоты, время которых ещё не прошло
         future_slots = [
             s for s in all_slots
-            if datetime.strptime(f"{s.date} {s.current_time}", "%Y-%m-%d %H:%M")
-                       .replace(tzinfo=TIMEZONE) >= now_tz
+            if TIMEZONE.localize(
+                   datetime.strptime(f"{s.date} {s.current_time}", "%Y-%m-%d %H:%M")
+               ) >= now_tz
         ]
         if not future_slots:
             continue
@@ -991,7 +1055,8 @@ async def admin_view_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for slot in day_slots:
                 if slot.is_booked:
                     booking = db.get_booking_by_slot_id(slot.id)
-                    client = f" — {booking['user_name']}" if booking else ""
+                    # H2: имя клиента экранируем — сообщение идёт с parse_mode='Markdown'
+                    client = f" — {_esc_md(booking['user_name'])}" if booking else ""
                     message += f"  ❌ {slot.base_time} → {slot.current_time}{client}\n"
                 elif slot.id in visible_ids:
                     message += f"  ✅ {slot.base_time} → {slot.current_time}\n"
@@ -1186,8 +1251,9 @@ async def admin_view_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Показываем только предстоящие записи (прошедшие — уже состоялись)
     bookings = [
         b for b in all_bookings
-        if datetime.strptime(f"{b['date']} {b['time']}", "%Y-%m-%d %H:%M")
-               .replace(tzinfo=TIMEZONE) >= now_tz
+        if TIMEZONE.localize(
+               datetime.strptime(f"{b['date']} {b['time']}", "%Y-%m-%d %H:%M")
+           ) >= now_tz
     ]
     if not bookings:
         await update.message.reply_text("📭 Нет предстоящих записей.")
@@ -1233,12 +1299,15 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent = failed = blocked = 0
     for user in users:
         try:
-            await context.bot.send_message(
+            if await _send_with_retry(
+                context.bot,
                 user['user_id'],
                 f"📢 **Сообщение от администратора:**\n\n{text}",
                 parse_mode='Markdown',
-            )
-            sent += 1
+            ):
+                sent += 1
+            else:
+                failed += 1
         except Forbidden:
             blocked += 1
             db.deactivate_user(user['user_id'])
@@ -1246,6 +1315,8 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             failed += 1
             logger.error(f"Broadcast failed for {user['user_id']}: {e}")
+        # H4: троттлинг ~20 сообщений/с — держимся ниже флуд-лимита Telegram
+        await asyncio.sleep(0.05)
 
     report = f"✅ Рассылка завершена!\n• Отправлено: {sent}"
     if blocked:
@@ -1302,10 +1373,12 @@ def main():
 
     application.add_error_handler(error_handler)
 
-    # Напоминания: каждые 5 минут
+    # Напоминания: каждую минуту.
+    # Частый опрос нужен, чтобы напоминание уходило близко к отметке «за 15 минут»
+    # (а не где-то в диапазоне). Окно в БД гарантирует «не раньше» нужного времени.
     application.job_queue.run_repeating(
         send_reminders,
-        interval=300,
+        interval=60,
         first=10,
     )
 

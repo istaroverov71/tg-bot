@@ -40,14 +40,14 @@ class Slot:
     booked_by: Optional[int]
 
     def get_datetime(self) -> datetime:
-        """Получить datetime для current_time"""
+        """Получить datetime для current_time (московское время через localize)"""
         dt_str = f"{self.date} {self.current_time}"
-        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=TIMEZONE)
+        return TIMEZONE.localize(datetime.strptime(dt_str, "%Y-%m-%d %H:%M"))
 
     def get_base_datetime(self) -> datetime:
-        """Получить datetime для base_time"""
+        """Получить datetime для base_time (московское время через localize)"""
         dt_str = f"{self.date} {self.base_time}"
-        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=TIMEZONE)
+        return TIMEZONE.localize(datetime.strptime(dt_str, "%Y-%m-%d %H:%M"))
 
     def get_end_time(self) -> datetime:
         """Время окончания сессии (по current_time)"""

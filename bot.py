@@ -487,12 +487,12 @@ async def process_final_booking(query, context, slot_id: int):
         _dl = _day_label(slot_info['day'], slot_info['date'])
 
         await query.edit_message_text(
-            f"✅ **Запись подтверждена!**\n\n"
+            f"✔️ **Запись подтверждена!**\n\n"
             f"📅 {_dl}\n"
             f"⏰ {display_time}\n\n"
             f"Сессия продлится 60 минут.\n"
             f"За 15 минут до начала я пришлю напоминание.\n\n"
-            f"До встречи! 🌸",
+            f"До встречи! 🫂🤍",
             parse_mode='Markdown',
         )
 
@@ -511,7 +511,7 @@ async def process_final_booking(query, context, slot_id: int):
             for admin_id in ADMIN_IDS:
                 try:
                     await context.bot.send_message(admin_id, admin_message)
-                    logger.info(f"✅ Уведомление о записи отправлено админу {admin_id}")
+                    logger.info(f"✔️ Уведомление о записи отправлено админу {admin_id}")
                 except Exception as e:
                     logger.error(f"❌ Не удалось уведомить админа {admin_id}: {e}", exc_info=True)
 
@@ -549,7 +549,7 @@ async def process_cancellation(query, context, booking_id: int):
 
     if db.cancel_booking_with_scheduler(user_id, booking_id):
         await query.edit_message_text(
-            "✅ **Запись успешно отменена.**\n\n"
+            "✔️ **Запись успешно отменена.**\n\n"
             "Если хотите записаться снова, нажмите кнопку «Запись» в главном меню.",
             parse_mode='Markdown',
         )
@@ -571,7 +571,7 @@ async def process_cancellation(query, context, booking_id: int):
                     f"{slot_info_str}"
                 )
                 await context.bot.send_message(admin_id, cancel_msg)
-                logger.info(f"✅ Уведомление об отмене отправлено админу {admin_id}")
+                logger.info(f"✔️ Уведомление об отмене отправлено админу {admin_id}")
             except Exception as e:
                 logger.error(f"❌ Не удалось уведомить админа {admin_id} об отмене: {e}", exc_info=True)
     else:

@@ -677,7 +677,7 @@ async def execute_change_booking(query, context, booking_id: int):
 
     if db.cancel_booking_with_scheduler(user_id, booking_id):
         await query.edit_message_text(
-            "✅ Текущая запись отменена.\n\nТеперь выберите новое время:"
+            "✔️ Текущая запись отменена.\n\nТеперь выберите новое время:"
         )
 
         # Уведомляем администратора об отмене в рамках переноса
@@ -707,7 +707,7 @@ async def execute_change_booking(query, context, booking_id: int):
 async def force_delete_day(query, context, date_str: str):
     if db.delete_day_slots(date_str):
         await query.edit_message_text(
-            f"✅ **День {date_str} полностью удалён.**\n\nВсе слоты и записи удалены.",
+            f"✔️ **День {date_str} полностью удалён.**\n\nВсе слоты и записи удалены.",
             parse_mode='Markdown',
         )
     else:
